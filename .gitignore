@@ -1,0 +1,7 @@
+*~
+*.a
+*.o
+build
+tmp
+.zig-cache
+zig-out
