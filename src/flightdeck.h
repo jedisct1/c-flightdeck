@@ -5,6 +5,7 @@
  * Those bytes depend on the key and on every string so far.
  * With an empty key, it's a hash function.
  *
+ * - flightdeck_hash(): hash a message in one call.
  * - flightdeck: the deck cipher.
  * - flightdeck_bo: authenticated encryption, with sessions.
  * - flightdeck_od: the overwrite duplex the deck cipher is built on, one block at a time.
@@ -128,6 +129,16 @@ void flightdeck_squeeze(flightdeck *deck, uint8_t *out, size_t out_len);
 
 /* Like flightdeck_squeeze(), but XOR the output with `in`. They can be the same buffer. */
 void flightdeck_xor(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len);
+
+/*
+ * Hash a message: same as a deck cipher with an empty key that absorbs the message with the empty trailer.
+ *
+ * Ask for at least 32 bytes with the 128-bit instances, and 64 bytes with the 256-bit ones.
+ * Collisions are then as hard to find as with TurboSHAKE or SHAKE.
+ * The digests are different from the ones of TurboSHAKE or KangarooTwelve.
+ */
+void flightdeck_hash(flightdeck_variant variant, uint8_t *out, size_t out_len, const uint8_t *in,
+                     size_t in_len);
 
 /*
  * Deck-BO, authenticated encryption on top of the deck cipher.

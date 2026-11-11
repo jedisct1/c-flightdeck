@@ -575,6 +575,16 @@ flightdeck_xor(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len)
 }
 
 void
+flightdeck_hash(flightdeck_variant variant, uint8_t *out, size_t out_len, const uint8_t *in,
+                size_t in_len)
+{
+    flightdeck deck;
+
+    flightdeck_init(&deck, variant, NULL, 0);
+    flightdeck_duplex(&deck, out, out_len, in, in_len, FLIGHTDECK_TRAILER_EMPTY);
+}
+
+void
 flightdeck_bo_init(flightdeck_bo *bo, flightdeck_variant variant, size_t tag_len,
                    const uint8_t *key, size_t key_len)
 {
