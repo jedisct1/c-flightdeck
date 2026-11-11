@@ -1,11 +1,12 @@
 /*
- * FlightDeck, a deck cipher that processes long inputs and outputs in parallel.
+ * FlightDeck, a deck cipher that processes long inputs and outputs in parallel, and Deck-BO, authenticated encryption built on it.
  *
  * A deck cipher takes a key and byte strings of any length, and gives back as many bytes as you want after each string.
  * Those bytes depend on the key and on every string so far.
  * With an empty key, it's a hash function.
  *
  * - flightdeck: the deck cipher.
+ * - flightdeck_bo: authenticated encryption, with sessions.
  * - flightdeck_od: the overwrite duplex the deck cipher is built on, one block at a time.
  *
  * Calls that the comments below rule out stop the program with abort().
@@ -16,7 +17,7 @@
  * Threads can use the library freely, as long as two of them don't use the same structure at the same time.
  *
  * FlightDeck: https://eprint.iacr.org/2026/2801
- * Overwrite duplex: https://eprint.iacr.org/2024/1618
+ * Overwrite duplex and Deck-BO: https://eprint.iacr.org/2024/1618
  */
 
 #ifndef FLIGHTDECK_H
@@ -127,6 +128,70 @@ void flightdeck_squeeze(flightdeck *deck, uint8_t *out, size_t out_len);
 
 /* Like flightdeck_squeeze(), but XOR the output with `in`. They can be the same buffer. */
 void flightdeck_xor(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len);
+
+/*
+ * Deck-BO, authenticated encryption on top of the deck cipher.
+ *
+ * It works on sessions: each message is authenticated along with all the ones before it.
+ * There's no nonce, so the same message with the same associated data, at the same point of a session, gets the same ciphertext.
+ * If that's a problem, put a nonce or a counter in the associated data.
+ *
+ * Keep one structure on each side, and go through every message in the same order on both.
+ * Encrypting a message and decrypting it leave the session in the same state, so one session can carry both directions when the two sides take turns.
+ * When they don't, use one session for each direction, each with its own key.
+ *
+ * Copy the structure to clone the session.
+ * Don't read or change its fields.
+ */
+typedef struct flightdeck_bo {
+    flightdeck deck;
+    size_t     tag_len;
+} flightdeck_bo;
+
+/*
+ * Start a session.
+ *
+ * `tag_len` is in bytes and can't be 0.
+ * A forgery succeeds with probability 2^-(8 * tag_len).
+ * A tag twice as long as the security level, so 32 bytes for 128 bits, also commits to the key, the associated data and the message.
+ */
+void flightdeck_bo_init(flightdeck_bo *bo, flightdeck_variant variant, size_t tag_len,
+                        const uint8_t *key, size_t key_len);
+
+/*
+ * Encrypt the next message of the session.
+ * `c` gets `m_len` bytes and can be the same buffer as `m`. `tag` gets `tag_len` bytes.
+ */
+void flightdeck_bo_encrypt(flightdeck_bo *bo, uint8_t *c, uint8_t *tag, const uint8_t *m,
+                           size_t m_len, const uint8_t *ad, size_t ad_len);
+
+/*
+ * Decrypt the next message of the session.
+ * `m` gets `c_len` bytes and can be the same buffer as `c`.
+ * `tag` is `tag_len` bytes long.
+ *
+ * Returns 0 if the tag matches.
+ * Otherwise, returns -1, zeroes `m` and leaves the session as it was.
+ * `m` is written before the tag is checked, so don't use it unless the function returned 0.
+ */
+int flightdeck_bo_decrypt(flightdeck_bo *bo, uint8_t *m, const uint8_t *c, size_t c_len,
+                          const uint8_t *tag, const uint8_t *ad, size_t ad_len);
+
+/*
+ * Mix `data` into the session, without sending anything.
+ * Both sides have to do it at the same point of the session.
+ */
+void flightdeck_bo_absorb(flightdeck_bo *bo, const uint8_t *data, size_t data_len);
+
+/*
+ * Get bytes that depend on the key and on everything that happened in the session so far, to derive new keys for instance.
+ * Both sides get the same bytes.
+ *
+ * Squeezing doesn't move the session forward, and squeezing again continues where the last call stopped.
+ * Something has to happen in the session before the first call.
+ * This isn't part of Deck-BO as published.
+ */
+void flightdeck_bo_squeeze(flightdeck_bo *bo, uint8_t *out, size_t out_len);
 
 #ifdef __cplusplus
 }

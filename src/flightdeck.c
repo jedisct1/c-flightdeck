@@ -1,5 +1,5 @@
 /*
- * The overwrite duplex, and FlightDeck on top of it.
+ * The overwrite duplex, FlightDeck on top of it, and Deck-BO on top of that.
  * The permutation and the loops over blocks are in flightdeck_backend.inc.
  *
  * Lanes are 64-bit words in the byte order of the machine, and byte strings are little-endian.
@@ -37,6 +37,12 @@
 /* Trailers of the blocks FlightDeck adds on its own. */
 #define FDECK_TRAILER_COUNTER        2u
 #define FDECK_TRAILER_CHAINING_VALUE 4u
+
+/* Trailers of Deck-BO. */
+#define FDECK_TRAILER_AD_ONLY 4u
+#define FDECK_TRAILER_AD      5u
+#define FDECK_TRAILER_TAG     13u
+#define FDECK_TRAILER_MESSAGE 14u
 
 /*
  * For each instance: variant, name, lanes in a block, lanes in a chaining value, blocks in a chunk, rounds, and the last byte of a block.
@@ -183,6 +189,24 @@ fdeck_clear(void *data, size_t len)
         bytes += 80;
     }
     memset(bytes, 0, len);
+}
+
+/* Zero a buffer in a way the compiler can't optimize away. */
+static void
+fdeck_wipe(void *data, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+    memset(data, 0, len);
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("" : : "r"(data) : "memory");
+#else
+    volatile uint8_t *bytes = (volatile uint8_t *) data;
+    while (len-- > 0) {
+        *bytes++ = 0;
+    }
+#endif
 }
 
 /* See absorb() in flightdeck_backend.inc. */
@@ -548,4 +572,104 @@ flightdeck_xor(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len)
 {
     FDECK_REQUIRE(in != NULL || len == 0);
     fdeck_output(deck, out, in, len);
+}
+
+void
+flightdeck_bo_init(flightdeck_bo *bo, flightdeck_variant variant, size_t tag_len,
+                   const uint8_t *key, size_t key_len)
+{
+    FDECK_REQUIRE(tag_len != 0);
+    flightdeck_init(&bo->deck, variant, key, key_len);
+    bo->tag_len = tag_len;
+}
+
+void
+flightdeck_bo_encrypt(flightdeck_bo *bo, uint8_t *c, uint8_t *tag, const uint8_t *m, size_t m_len,
+                      const uint8_t *ad, size_t ad_len)
+{
+    flightdeck keystream;
+
+    if (m_len == 0) {
+        flightdeck_duplex(&bo->deck, tag, bo->tag_len, ad, ad_len, FDECK_TRAILER_AD_ONLY);
+        return;
+    }
+    if (ad_len != 0) {
+        flightdeck_duplex(&bo->deck, NULL, 0, ad, ad_len, FDECK_TRAILER_AD);
+    }
+    flightdeck_clone_compact(&keystream, &bo->deck);
+    flightdeck_duplex(&bo->deck, tag, bo->tag_len, m, m_len, FDECK_TRAILER_MESSAGE);
+    flightdeck_duplex(&keystream, NULL, 0, tag, bo->tag_len, FDECK_TRAILER_TAG);
+    flightdeck_xor(&keystream, c, m, m_len);
+}
+
+/*
+ * Squeeze a tag from a deck in pieces, since it can be any length, and compare it with `tag` in constant time.
+ * Returns 0 if they match.
+ * With a NULL `tag`, the tag is only skipped.
+ */
+static unsigned
+fdeck_bo_check_tag(flightdeck *deck, const uint8_t *tag, size_t tag_len)
+{
+    uint8_t  piece[64];
+    unsigned difference = 0;
+
+    while (tag_len != 0) {
+        const size_t n = fdeck_min(tag_len, sizeof piece);
+
+        flightdeck_squeeze(deck, piece, n);
+        if (tag != NULL) {
+            for (size_t i = 0; i < n; i++) {
+                difference |= piece[i] ^ tag[i];
+            }
+            tag += n;
+        }
+        tag_len -= n;
+    }
+    return difference;
+}
+
+int
+flightdeck_bo_decrypt(flightdeck_bo *bo, uint8_t *m, const uint8_t *c, size_t c_len,
+                      const uint8_t *tag, const uint8_t *ad, size_t ad_len)
+{
+    flightdeck deck;
+
+    /* Work on a clone, so that a message that doesn't authenticate leaves the session alone. */
+    flightdeck_clone_compact(&deck, &bo->deck);
+    if (c_len == 0) {
+        flightdeck_duplex(&deck, NULL, 0, ad, ad_len, FDECK_TRAILER_AD_ONLY);
+    } else {
+        flightdeck keystream;
+
+        if (ad_len != 0) {
+            flightdeck_duplex(&deck, NULL, 0, ad, ad_len, FDECK_TRAILER_AD);
+        }
+        flightdeck_clone_compact(&keystream, &deck);
+        flightdeck_duplex(&keystream, NULL, 0, tag, bo->tag_len, FDECK_TRAILER_TAG);
+        flightdeck_xor(&keystream, m, c, c_len);
+        flightdeck_duplex(&deck, NULL, 0, m, c_len, FDECK_TRAILER_MESSAGE);
+    }
+    if (fdeck_bo_check_tag(&deck, tag, bo->tag_len) != 0) {
+        fdeck_wipe(m, c_len);
+        return -1;
+    }
+    bo->deck = deck;
+    return 0;
+}
+
+void
+flightdeck_bo_absorb(flightdeck_bo *bo, const uint8_t *data, size_t data_len)
+{
+    /*
+     * Same as an empty message.
+     * Its tag is skipped, so that flightdeck_bo_squeeze() starts after it.
+     */
+    flightdeck_duplex(&bo->deck, NULL, 0, data, data_len, FDECK_TRAILER_AD_ONLY);
+    fdeck_bo_check_tag(&bo->deck, NULL, bo->tag_len);
+}
+
+void
+flightdeck_bo_squeeze(flightdeck_bo *bo, uint8_t *out, size_t out_len)
+{
+    flightdeck_squeeze(&bo->deck, out, out_len);
 }
