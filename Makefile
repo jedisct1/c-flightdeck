@@ -11,7 +11,16 @@ libflightdeck.a: flightdeck.o
 flightdeck.o: $(SOURCES)
 	$(CC) $(CFLAGS) $(WARNINGS) -c src/flightdeck.c -o $@
 
-clean:
-	rm -f flightdeck.o libflightdeck.a
+build:
+	mkdir -p build
 
-.PHONY: all clean
+build/test: tests/test.c tests/sweep.h libflightdeck.a | build
+	$(CC) $(CFLAGS) $(WARNINGS) -Isrc tests/test.c libflightdeck.a -o $@
+
+test: build/test
+	./build/test
+
+clean:
+	rm -rf build flightdeck.o libflightdeck.a
+
+.PHONY: all test clean
