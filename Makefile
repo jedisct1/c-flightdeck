@@ -20,7 +20,13 @@ build/test: tests/test.c tests/sweep.h libflightdeck.a | build
 test: build/test
 	./build/test
 
+build/bench: bench/bench.c libflightdeck.a | build
+	$(CC) $(CFLAGS) $(WARNINGS) -Isrc bench/bench.c libflightdeck.a -o $@
+
+bench: build/bench
+	./build/bench
+
 clean:
 	rm -rf build flightdeck.o libflightdeck.a
 
-.PHONY: all test clean
+.PHONY: all test bench clean
