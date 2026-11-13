@@ -238,6 +238,24 @@ typedef const struct flightdeck_instance fdeck_instance;
 
 static const struct flightdeck_instance fdeck_instances[] = { FDECK_INSTANCES(FDECK_C_INSTANCE) };
 
+/* The capacity of each instance after absorbing an empty key, so that hashing can skip that step. */
+static const uint64_t fdeck_empty_key[][FDECK_CAPACITY_LANES_MAX] = {
+    [FLIGHTDECK_TURBOSHAKE128] = {
+        0x4017237825f2aeaf, 0x05fd662a978187d6, 0xa01df91a4f6002e6, 0x97f487c3df786970, 0xf2c9682cca7502d6,
+    },
+    [FLIGHTDECK_TURBOSHAKE256] = {
+        0x5ddcd29d8467a4eb, 0xcd3efbef2f6ce29a, 0xa8d3312d5f599c82, 0x678b9d2f4614e912, 0x3f21c4ca810e4712,
+        0x7de321afbf58c43c, 0x58c884507c10f30a, 0x066fe52518bca295, 0x40fa6b9e0b729858,
+    },
+    [FLIGHTDECK_SHAKE128] = {
+        0x16c4be8782151ed8, 0x3b8e07fd1d0da28e, 0xc8292a74a7d7340c, 0x58d772267a37dadf, 0xa6d659450906f0ba,
+    },
+    [FLIGHTDECK_SHAKE256] = {
+        0xb0306736a49c04d3, 0xc1619cf5044d4bc3, 0xee6471a45c80faaa, 0x5b9c10dd45eb629b, 0xd2279c1f993904a2,
+        0x1ec931844d38cb09, 0x601caf92106c782a, 0x86dce988ca004271, 0x593e783554a42292,
+    },
+};
+
 static fdeck_instance *
 fdeck_instance_of(flightdeck_variant variant)
 {
@@ -497,7 +515,11 @@ flightdeck_od_init(flightdeck_od *d, flightdeck_variant variant, const uint8_t *
     FDECK_REQUIRE(key_len <= fdeck_rate(im));
     fdeck_clear(d->state, sizeof d->state);
     d->instance = im;
-    fdeck_duplex(im, d->state, key, key_len, FLIGHTDECK_TRAILER_EMPTY);
+    if (key_len == 0) {
+        memcpy(d->state + im->rate_lanes, fdeck_empty_key[variant], fdeck_capacity_len(im));
+    } else {
+        fdeck_duplex(im, d->state, key, key_len, FLIGHTDECK_TRAILER_EMPTY);
+    }
     d->offset = fdeck_rate(im);
 }
 
@@ -578,10 +600,24 @@ void
 flightdeck_hash(flightdeck_variant variant, uint8_t *out, size_t out_len, const uint8_t *in,
                 size_t in_len)
 {
-    flightdeck deck;
+    fdeck_instance *im = fdeck_instance_of(variant);
+    uint64_t        cap[FDECK_CAPACITY_LANES_MAX];
+    uint64_t        lanes[FDECK_CV_LANES_MAX];
+    uint8_t         digest[8 * FDECK_CV_LANES_MAX];
+    flightdeck      deck;
 
-    flightdeck_init(&deck, variant, NULL, 0);
-    flightdeck_duplex(&deck, out, out_len, in, in_len, FLIGHTDECK_TRAILER_EMPTY);
+    if (out_len > 8 * (size_t) im->cv_lanes) {
+        flightdeck_init(&deck, variant, NULL, 0);
+        flightdeck_duplex(&deck, out, out_len, in, in_len, FLIGHTDECK_TRAILER_EMPTY);
+        return;
+    }
+    /* A short digest fits in the lanes of a chaining value, which are cheaper to compute than a whole state. */
+    memcpy(cap, fdeck_empty_key[variant], sizeof cap);
+    fdeck_absorb_string(im, cap, in, in_len,
+                        (unsigned) fdeck_append_bit(FLIGHTDECK_TRAILER_EMPTY, 1), lanes, 0);
+    if (out_len != 0) {
+        memcpy(out, fdeck_lane_bytes(lanes, im->cv_lanes, digest), out_len);
+    }
 }
 
 void
