@@ -10,6 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * On x86-64, the AVX-512 backend is built along with the plain C one, and used when the CPU and operating system support it.
+ * FLIGHTDECK_PORTABLE only builds the plain C backend.
+ */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && \
+    !defined(FLIGHTDECK_PORTABLE)
+#    define FDECK_X86 1
+#    include <cpuid.h>
+#    include <immintrin.h>
+#    include <stdatomic.h>
+#else
+#    define FDECK_X86 0
+#endif
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #    define FDECK_LITTLE_ENDIAN 1
 #else
@@ -27,6 +41,7 @@
 #define FDECK_RATE_MAX           160
 #define FDECK_CAPACITY_LANES_MAX 9
 #define FDECK_CV_LANES_MAX       8
+#define FDECK_WIDTH_MAX          4
 
 /* Room for the chaining values waiting to be absorbed by the main duplex. */
 #define FDECK_PENDING_MAX 4096
@@ -209,17 +224,31 @@ fdeck_wipe(void *data, size_t len)
 #endif
 }
 
-/* See absorb() in flightdeck_backend.inc. */
+/* See absorb() and output() in flightdeck_backend.inc. */
 typedef void fdeck_absorb_fn(uint64_t *caps, const uint8_t *const *in, size_t nblocks,
                              const uint8_t *const *last, const uint64_t *last_trailers,
                              uint64_t *out, int whole_state);
+typedef void fdeck_output_fn(uint8_t *out, const uint8_t *in, const uint64_t *cap, uint64_t index);
+
+/*
+ * Functions for `width` states at once.
+ * Not every width has an output function.
+ */
+typedef struct fdeck_batch {
+    unsigned         width;
+    fdeck_absorb_fn *absorb;
+    fdeck_output_fn *output;
+} fdeck_batch;
 
 struct flightdeck_instance {
-    unsigned         rate_lanes;
-    unsigned         cv_lanes;
-    unsigned         blocks_per_chunk;
-    uint8_t          pad;
+    unsigned rate_lanes;
+    unsigned cv_lanes;
+    unsigned blocks_per_chunk;
+    uint8_t  pad;
+    /* For a single state. */
     fdeck_absorb_fn *absorb;
+    /* Narrowest first, ended by a width of 0. */
+    fdeck_batch batches[4];
 };
 
 typedef const struct flightdeck_instance fdeck_instance;
@@ -233,10 +262,109 @@ typedef const struct flightdeck_instance fdeck_instance;
 #define FDECK_TARGET
 #include "flightdeck_backend.inc"
 
-#define FDECK_C_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, pad) \
-    [variant] = { rate_lanes, cv_lanes, blocks_per_chunk, pad, fdeck_##name##_absorb_c },
+#define FDECK_C_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, pad)      \
+    [variant] = { rate_lanes,           cv_lanes, blocks_per_chunk, pad, fdeck_##name##_absorb_c, \
+                  { { 0, NULL, NULL } } },
 
-static const struct flightdeck_instance fdeck_instances[] = { FDECK_INSTANCES(FDECK_C_INSTANCE) };
+enum { FDECK_PORTABLE, FDECK_AVX512 };
+
+#if FDECK_X86
+
+#    define FDECK_AVX512_TARGET __attribute__((target("avx512f,avx512vl,bmi,bmi2")))
+
+/* With AVX-512, a single state is fastest with each lane in its own register. */
+#    define FDECK_N                 1
+#    define FDECK_V                 __m128i
+#    define FDECK_FN(name)          fdeck_##name##_avx512_x1
+#    define FDECK_TARGET            FDECK_AVX512_TARGET
+#    define FDECK_XOR(a, b)         _mm_xor_si128(a, b)
+#    define FDECK_XOR3(a, b, c)     _mm_ternarylogic_epi64(a, b, c, 0x96)
+#    define FDECK_CHI(a, b, c)      _mm_ternarylogic_epi64(a, b, c, 0xd2)
+#    define FDECK_ROL(a, n)         _mm_rol_epi64(a, n)
+#    define FDECK_SET1(x)           _mm_cvtsi64_si128((long long) (x))
+#    define FDECK_LOAD_LANES(p)     _mm_loadu_si64(p)
+#    define FDECK_STORE_LANES(p, v) _mm_storeu_si64(p, v)
+#    define FDECK_LOAD_BYTES(p)     _mm_loadu_si64(p)
+#    include "flightdeck_backend.inc"
+
+#    define FDECK_N                 4
+#    define FDECK_V                 __m256i
+#    define FDECK_FN(name)          fdeck_##name##_avx512_x4
+#    define FDECK_TARGET            FDECK_AVX512_TARGET
+#    define FDECK_XOR(a, b)         _mm256_xor_si256(a, b)
+#    define FDECK_XOR3(a, b, c)     _mm256_ternarylogic_epi64(a, b, c, 0x96)
+#    define FDECK_CHI(a, b, c)      _mm256_ternarylogic_epi64(a, b, c, 0xd2)
+#    define FDECK_ROL(a, n)         _mm256_rol_epi64(a, n)
+#    define FDECK_SET1(x)           _mm256_set1_epi64x((long long) (x))
+#    define FDECK_LOAD_LANES(p)     _mm256_loadu_si256((const __m256i *) (p))
+#    define FDECK_STORE_LANES(p, v) _mm256_storeu_si256((__m256i *) (p), v)
+#    include "flightdeck_backend.inc"
+
+#    define FDECK_AVX512_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, \
+                                  pad)                                                           \
+        [variant] = {                                                                            \
+            rate_lanes,                                                                          \
+            cv_lanes,                                                                            \
+            blocks_per_chunk,                                                                    \
+            pad,                                                                                 \
+            fdeck_##name##_absorb_avx512_x1,                                                     \
+            { { 4, fdeck_##name##_absorb_avx512_x4, fdeck_##name##_output_avx512_x4 } },         \
+        },
+
+/*
+ * The best backend this CPU and operating system can run.
+ * This doesn't use __builtin_cpu_supports(), which relies on data that another C runtime in the same program may leave empty.
+ */
+__attribute__((target("xsave"))) static int
+fdeck_detect_backend(void)
+{
+    unsigned eax, ebx, ecx, edx;
+    unsigned saved;
+
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx) || (ecx & bit_OSXSAVE) == 0 ||
+        (ecx & bit_AVX) == 0) {
+        return FDECK_PORTABLE;
+    }
+    /* The operating system also has to save the 512-bit and mask registers. */
+    saved = (unsigned) _xgetbv(0);
+    if ((saved & 0xe6) != 0xe6 || !__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) ||
+        (ebx & bit_BMI) == 0 || (ebx & bit_BMI2) == 0 || (ebx & bit_AVX512F) == 0 ||
+        (ebx & bit_AVX512VL) == 0) {
+        return FDECK_PORTABLE;
+    }
+    return FDECK_AVX512;
+}
+
+#endif
+
+static const struct fdeck_backend {
+    const char                *name;
+    struct flightdeck_instance instances[4];
+} fdeck_backends[] = {
+    [FDECK_PORTABLE] = { "portable", { FDECK_INSTANCES(FDECK_C_INSTANCE) } },
+#if FDECK_X86
+    [FDECK_AVX512] = { "avx512", { FDECK_INSTANCES(FDECK_AVX512_INSTANCE) } },
+#endif
+};
+
+/* The backend to use. The CPU is only checked once. */
+static int
+fdeck_backend_id(void)
+{
+#if FDECK_X86
+    /* If threads race here, they all store the same value. */
+    static atomic_int cached  = -1;
+    int               backend = atomic_load_explicit(&cached, memory_order_relaxed);
+
+    if (backend < 0) {
+        backend = fdeck_detect_backend();
+        atomic_store_explicit(&cached, backend, memory_order_relaxed);
+    }
+    return backend;
+#else
+    return FDECK_PORTABLE;
+#endif
+}
 
 /* The capacity of each instance after absorbing an empty key, so that hashing can skip that step. */
 static const uint64_t fdeck_empty_key[][FDECK_CAPACITY_LANES_MAX] = {
@@ -259,8 +387,10 @@ static const uint64_t fdeck_empty_key[][FDECK_CAPACITY_LANES_MAX] = {
 static fdeck_instance *
 fdeck_instance_of(flightdeck_variant variant)
 {
-    FDECK_REQUIRE((size_t) variant < sizeof fdeck_instances / sizeof fdeck_instances[0]);
-    return &fdeck_instances[variant];
+    const struct fdeck_backend *backend = &fdeck_backends[fdeck_backend_id()];
+
+    FDECK_REQUIRE((size_t) variant < sizeof backend->instances / sizeof backend->instances[0]);
+    return &backend->instances[variant];
 }
 
 static inline size_t
@@ -273,6 +403,28 @@ static inline size_t
 fdeck_capacity_len(fdeck_instance *im)
 {
     return 8 * (25 - (size_t) im->rate_lanes);
+}
+
+/*
+ * The batch for `count` chunks, or for `count` output blocks if `for_output` is set.
+ *
+ * That's the smallest batch that fits `count`, or the largest one if none does, since bigger batches cost more.
+ * So a shorter last chunk only gets a slot that would be unused otherwise.
+ */
+static const fdeck_batch *
+fdeck_batch_for(fdeck_instance *im, size_t count, int for_output)
+{
+    const fdeck_batch *best = NULL;
+
+    for (const fdeck_batch *batch = im->batches; batch->width != 0; batch++) {
+        if (for_output && batch->output == NULL) {
+            continue;
+        }
+        if (best == NULL || best->width < count) {
+            best = batch;
+        }
+    }
+    return best;
 }
 
 /*
@@ -330,7 +482,7 @@ fdeck_absorb_string(fdeck_instance *im, uint64_t *cap, const uint8_t *in, size_t
     uint64_t       trailer_lane;
     size_t         nblocks = 0;
 
-    /* Past one chunk, the other chunks give chaining values, and what's left for this state comes back in `pending`. */
+    /* Past one chunk, the chunks are absorbed in parallel, and what's left for this state comes back in `pending`. */
     if (len > rate * im->blocks_per_chunk) {
         len = fdeck_absorb_chunks(im, cap, in, len, pending);
         in  = pending;
@@ -365,7 +517,7 @@ fdeck_chaining_value(fdeck_instance *im, uint8_t *cv, const uint64_t *cap, const
 
 /*
  * Where the next `count` chaining values go.
- * They pile up in `pending`, and the main duplex absorbs them several blocks at a time.
+ * They pile up in `pending` before the main duplex absorbs them, because going back and forth between the main duplex and the batches is slow.
  */
 static uint8_t *
 fdeck_reserve_cvs(fdeck_instance *im, uint64_t *cap, uint8_t *pending, size_t *pending_len,
@@ -395,19 +547,120 @@ fdeck_reserve_cvs(fdeck_instance *im, uint64_t *cap, uint8_t *pending, size_t *p
  * The main duplex, given by its capacity, absorbs the first chunk.
  * Every other chunk goes to a compact clone of the main duplex as it was before the call, which gives a chaining value.
  * The main duplex then absorbs the chaining values.
+ *
+ * The first chunk is a whole number of blocks and more input follows it, so none of its blocks is the last one.
+ * That's why the main duplex can absorb it in the same batch as the clones.
  */
 static size_t
 fdeck_absorb_chunks(fdeck_instance *im, uint64_t *cap, const uint8_t *in, size_t len,
                     uint8_t *pending)
 {
-    const size_t chunk = fdeck_rate(im) * im->blocks_per_chunk;
-    uint64_t     start[FDECK_CAPACITY_LANES_MAX];
-    size_t       pending_len = 0;
+    const size_t   rate      = fdeck_rate(im);
+    const size_t   chunk     = rate * im->blocks_per_chunk;
+    const size_t   cv_len    = 8 * (size_t) im->cv_lanes;
+    const unsigned cap_lanes = 25 - im->rate_lanes;
+    uint64_t       start[FDECK_CAPACITY_LANES_MAX];
+    size_t         pending_len = 0;
+    int            first       = 1;
 
     memcpy(start, cap, fdeck_capacity_len(im));
-    fdeck_absorb_blocks(im, cap, in, im->blocks_per_chunk);
-    in += chunk;
-    len -= chunk;
+
+    for (;;) {
+        const size_t       full     = len / chunk;
+        const size_t       tail_len = len % chunk;
+        const fdeck_batch *batch    = fdeck_batch_for(im, full, 0);
+        const uint8_t     *blocks[FDECK_WIDTH_MAX];
+        const uint8_t     *last_blocks[FDECK_WIDTH_MAX];
+        uint64_t           trailers[FDECK_WIDTH_MAX];
+        uint64_t           caps[FDECK_CAPACITY_LANES_MAX * FDECK_WIDTH_MAX];
+        uint64_t           cvs[FDECK_CV_LANES_MAX * FDECK_WIDTH_MAX];
+        uint8_t            tail_block[FDECK_RATE_MAX];
+        uint8_t           *cv_bytes;
+        size_t             before = im->blocks_per_chunk - 1;
+        size_t             count;
+        size_t             used;
+        unsigned           width;
+        int                tail_joins;
+
+        if (batch == NULL || full + (tail_len != 0) < 2) {
+            break;
+        }
+        width      = batch->width;
+        count      = fdeck_min(full, width);
+        tail_joins = count < width && tail_len != 0;
+        used       = count + (size_t) tail_joins;
+
+        /* Unused slots get the first chunk again, so that every read stays inside the input. */
+        for (unsigned i = 0; i < width; i++) {
+            blocks[i]   = in + (i < count ? i * chunk : 0);
+            trailers[i] = fdeck_trailer_lane(FDECK_TRAILER_CHAINING_VALUE, 1, im->pad);
+            for (unsigned lane = 0; lane < cap_lanes; lane++) {
+                caps[width * lane + i] = start[lane];
+            }
+        }
+        if (first) {
+            trailers[0] = fdeck_trailer_lane(FLIGHTDECK_TRAILER_EMPTY, 1, im->pad);
+        }
+        if (tail_joins) {
+            /* The shorter last chunk starts late, so that its last block lines up with the last block of the others. */
+            const size_t tail_blocks = (tail_len - 1) / rate;
+            const size_t head        = before - tail_blocks;
+
+            if (head != 0 && count == 1) {
+                /* Only one chunk until then, and the code for a single state is cheaper. */
+                uint64_t one[FDECK_CAPACITY_LANES_MAX];
+
+                memcpy(one, start, fdeck_capacity_len(im));
+                fdeck_absorb_blocks(im, one, in, head);
+                for (unsigned lane = 0; lane < cap_lanes; lane++) {
+                    caps[width * lane] = one[lane];
+                }
+            } else if (head != 0) {
+                batch->absorb(caps, blocks, head, NULL, NULL, NULL, 0);
+            }
+            for (unsigned i = 0; i < width; i++) {
+                blocks[i] += head * rate;
+            }
+            for (unsigned lane = 0; lane < cap_lanes; lane++) {
+                caps[width * lane + count] = start[lane];
+            }
+            blocks[count] = in + count * chunk;
+            before        = tail_blocks;
+        }
+        for (unsigned i = 0; i < width; i++) {
+            last_blocks[i] = blocks[i] + before * rate;
+        }
+        if (tail_joins) {
+            last_blocks[count] =
+                fdeck_last_block(im, tail_block, last_blocks[count], tail_len - before * rate,
+                                 FDECK_TRAILER_CHAINING_VALUE, &trailers[count]);
+        }
+        batch->absorb(caps, blocks, before, last_blocks, trailers, cvs, 0);
+
+        if (first) {
+            /* The first slot was the main duplex. */
+            for (unsigned lane = 0; lane < cap_lanes; lane++) {
+                cap[lane] = caps[width * lane];
+            }
+        }
+        cv_bytes = fdeck_reserve_cvs(im, cap, pending, &pending_len, used - (size_t) first);
+        for (size_t i = (size_t) first; i < used; i++) {
+            for (unsigned lane = 0; lane < im->cv_lanes; lane++) {
+                fdeck_store_lanes(cv_bytes + (i - (size_t) first) * cv_len + 8 * lane,
+                                  &cvs[width * lane + i], 1);
+            }
+        }
+        in += count * chunk;
+        len   = tail_joins ? 0 : len - count * chunk;
+        first = 0;
+    }
+
+    /* What's left when there is no batch, or not enough chunks for one. */
+    if (first) {
+        fdeck_absorb_blocks(im, cap, in, im->blocks_per_chunk);
+        in += chunk;
+        len -= chunk;
+    }
     while (len != 0) {
         const size_t n = fdeck_min(len, chunk);
 
@@ -465,14 +718,30 @@ fdeck_output(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len)
     }
     /* Every other block comes from a compact clone that absorbed the block number. */
     while (i < len) {
-        const size_t n = fdeck_min(len - i, rate);
-        uint8_t      block[FDECK_RATE_MAX];
+        const size_t       left   = len - i;
+        const size_t       needed = left / rate + (left % rate != 0);
+        const fdeck_batch *batch  = needed < 2 ? NULL : fdeck_batch_for(im, needed, 1);
+        const uint64_t     index  = offset / rate;
+        size_t             n;
 
-        fdeck_output_block(im, block, cap, offset / rate);
-        fdeck_xor_bytes(out + i, in == NULL ? NULL : in + i, block, n);
-        /* Keep a partly used block for the next call. */
-        if (n != rate) {
-            memcpy(deck->block, block, rate);
+        if (batch != NULL && left >= batch->width * rate) {
+            n = batch->width * rate;
+            batch->output(out + i, in == NULL ? NULL : in + i, cap, index);
+        } else {
+            uint8_t blocks[FDECK_WIDTH_MAX * FDECK_RATE_MAX];
+
+            if (batch != NULL) {
+                batch->output(blocks, NULL, cap, index);
+                n = left;
+            } else {
+                fdeck_output_block(im, blocks, cap, index);
+                n = fdeck_min(left, rate);
+            }
+            fdeck_xor_bytes(out + i, in == NULL ? NULL : in + i, blocks, n);
+            /* Keep a partly used block for the next call. */
+            if (n % rate != 0) {
+                memcpy(deck->block, blocks + n - n % rate, rate);
+            }
         }
         offset += n;
         i += n;
@@ -493,6 +762,12 @@ fdeck_od_output(flightdeck_od *d, uint8_t *out, const uint8_t *in, size_t len)
                         len);
     }
     d->offset += len;
+}
+
+const char *
+flightdeck_implementation(void)
+{
+    return fdeck_backends[fdeck_backend_id()].name;
 }
 
 size_t

@@ -1,4 +1,8 @@
-/* Tests for the overwrite duplex, FlightDeck and Deck-BO. */
+/*
+ * Tests for the overwrite duplex, FlightDeck and Deck-BO.
+ *
+ * `make test` builds this file twice: with the best backend for the CPU, and with the plain C code only.
+ */
 
 #define _DEFAULT_SOURCE
 
@@ -310,7 +314,7 @@ test_hash(void)
 
 /*
  * Output that ends right before a guard page, since reading or writing too far wouldn't change any result.
- * First deck output XORed in place, with lengths around whole numbers of blocks, then duplex output.
+ * First deck output XORed in place, with lengths around the batch sizes of the backends, then duplex output.
  */
 static void
 test_output_ends(void)
@@ -405,6 +409,19 @@ test_parameters(void)
         CHECK(flightdeck_key_len(variants[v]) == (v & 1 ? 32 : 16));
         CHECK(flightdeck_key_len_max(variants[v]) == sweep_rate(v));
     }
+
+#ifdef FLIGHTDECK_PORTABLE
+    CHECK(strcmp(flightdeck_implementation(), "portable") == 0);
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    /*
+     * When the compiler's runtime sees AVX-512, the library has to use it too.
+     * The reverse isn't checked, because with some C runtimes the builtin always says no.
+     */
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") &&
+        __builtin_cpu_supports("bmi") && __builtin_cpu_supports("bmi2")) {
+        CHECK(strcmp(flightdeck_implementation(), "avx512") == 0);
+    }
+#endif
 }
 
 #if HAVE_POSIX
@@ -535,9 +552,9 @@ main(void)
     test_misuse();
 #endif
     if (failures != 0) {
-        printf("%d checks failed\n", failures);
+        printf("%d checks failed (%s)\n", failures, flightdeck_implementation());
         return 1;
     }
-    printf("all tests passed\n");
+    printf("all tests passed (%s)\n", flightdeck_implementation());
     return 0;
 }

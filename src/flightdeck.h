@@ -42,6 +42,9 @@ typedef enum flightdeck_variant {
     FLIGHTDECK_SHAKE256      = 3
 } flightdeck_variant;
 
+/* The backend used on this machine: "avx512" or "portable". */
+const char *flightdeck_implementation(void);
+
 /* Recommended key length in bytes: 16 for the 128-bit instances, 32 for the 256-bit ones. */
 size_t flightdeck_key_len(flightdeck_variant variant);
 

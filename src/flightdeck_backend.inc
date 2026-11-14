@@ -5,6 +5,8 @@
  * Vector code also defines FDECK_V, FDECK_XOR(), FDECK_XOR3(), FDECK_CHI(), FDECK_ROL(), FDECK_SET1(), FDECK_LOAD_LANES() and FDECK_STORE_LANES(), plus FDECK_LOAD_BYTES() for a single state.
  * Without them, the code works on plain 64-bit words.
  *
+ * Loading and storing blocks is written for 4 states on x86.
+ *
  * A vector holds the same lane of every state.
  * A block overwrites the start of a state, so only the lanes after it, the capacity, carry over from one block to the next.
  * They are passed around as `caps[FDECK_N * lane + state]`.
@@ -163,16 +165,91 @@ FDECK_FN(store_capacity)(uint64_t *caps, const FDECK_V a[25], unsigned rate_lane
 #undef FDECK_DO
 }
 
+#if FDECK_N == 4
+
+FDECK_INLINE void
+FDECK_FN(transpose)(FDECK_V v[4])
+{
+    const FDECK_V t0 = _mm256_unpacklo_epi64(v[0], v[1]);
+    const FDECK_V t1 = _mm256_unpackhi_epi64(v[0], v[1]);
+    const FDECK_V t2 = _mm256_unpacklo_epi64(v[2], v[3]);
+    const FDECK_V t3 = _mm256_unpackhi_epi64(v[2], v[3]);
+
+    v[0] = _mm256_permute2x128_si256(t0, t2, 0x20);
+    v[1] = _mm256_permute2x128_si256(t1, t3, 0x20);
+    v[2] = _mm256_permute2x128_si256(t0, t2, 0x31);
+    v[3] = _mm256_permute2x128_si256(t1, t3, 0x31);
+}
+
+FDECK_INLINE void
+FDECK_FN(load_block)(FDECK_V a[25], const uint8_t *const in[4], unsigned rate_lanes)
+{
+#    define FDECK_ROWS(lane)                                                        \
+        do {                                                                        \
+            a[lane]     = _mm256_loadu_si256((const __m256i *) (in[0] + 8 * lane)); \
+            a[lane + 1] = _mm256_loadu_si256((const __m256i *) (in[1] + 8 * lane)); \
+            a[lane + 2] = _mm256_loadu_si256((const __m256i *) (in[2] + 8 * lane)); \
+            a[lane + 3] = _mm256_loadu_si256((const __m256i *) (in[3] + 8 * lane)); \
+            FDECK_FN(transpose)(a + lane);                                          \
+        } while (0)
+    FDECK_ROWS(0);
+    FDECK_ROWS(4);
+    FDECK_ROWS(8);
+    FDECK_ROWS(12);
+    if (rate_lanes == 20) {
+        FDECK_ROWS(16);
+    }
+#    undef FDECK_ROWS
+}
+
+FDECK_INLINE void
+FDECK_FN(store_block)(uint8_t *out, const uint8_t *in, FDECK_V a[25], unsigned rate_lanes)
+{
+    const size_t rate = 8 * (size_t) rate_lanes;
+
+#    define FDECK_ROW_OUT(lane, i)                                                          \
+        do {                                                                                \
+            FDECK_V row = a[lane + i];                                                      \
+            if (in != NULL) {                                                               \
+                row = _mm256_xor_si256(                                                     \
+                    row, _mm256_loadu_si256((const __m256i *) (in + i * rate + 8 * lane))); \
+            }                                                                               \
+            _mm256_storeu_si256((__m256i *) (out + i * rate + 8 * lane), row);              \
+        } while (0)
+#    define FDECK_ROWS(lane)               \
+        do {                               \
+            FDECK_FN(transpose)(a + lane); \
+            FDECK_ROW_OUT(lane, 0);        \
+            FDECK_ROW_OUT(lane, 1);        \
+            FDECK_ROW_OUT(lane, 2);        \
+            FDECK_ROW_OUT(lane, 3);        \
+        } while (0)
+    FDECK_ROWS(0);
+    FDECK_ROWS(4);
+    FDECK_ROWS(8);
+    FDECK_ROWS(12);
+    if (rate_lanes == 20) {
+        FDECK_ROWS(16);
+    }
+#    undef FDECK_ROWS
+#    undef FDECK_ROW_OUT
+}
+
+#    define FDECK_COUNTERS(index) \
+        _mm256_add_epi64(_mm256_set1_epi64x((long long) (index)), _mm256_setr_epi64x(0, 1, 2, 3))
+
+#else
+
 FDECK_INLINE void
 FDECK_FN(load_block)(FDECK_V a[25], const uint8_t *const in[1], unsigned rate_lanes)
 {
-#define FDECK_LANES(lane)                                      \
-    do {                                                       \
-        a[lane]     = FDECK_LOAD_BYTES(in[0] + 8 * lane);      \
-        a[lane + 1] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 8);  \
-        a[lane + 2] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 16); \
-        a[lane + 3] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 24); \
-    } while (0)
+#    define FDECK_LANES(lane)                                      \
+        do {                                                       \
+            a[lane]     = FDECK_LOAD_BYTES(in[0] + 8 * lane);      \
+            a[lane + 1] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 8);  \
+            a[lane + 2] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 16); \
+            a[lane + 3] = FDECK_LOAD_BYTES(in[0] + 8 * lane + 24); \
+        } while (0)
     FDECK_LANES(0);
     FDECK_LANES(4);
     FDECK_LANES(8);
@@ -180,8 +257,10 @@ FDECK_FN(load_block)(FDECK_V a[25], const uint8_t *const in[1], unsigned rate_la
     if (rate_lanes == 20) {
         FDECK_LANES(16);
     }
-#undef FDECK_LANES
+#    undef FDECK_LANES
 }
+
+#endif
 
 FDECK_INLINE void
 FDECK_FN(store_state)(uint64_t *states, const FDECK_V a[25])
@@ -271,6 +350,58 @@ FDECK_FN(absorb)(uint64_t *caps, const uint8_t *const in[FDECK_N], size_t nblock
     FDECK_FN(store_capacity)(caps, a, rate_lanes);
 }
 
+#if FDECK_N > 1
+
+/*
+ * The output blocks `index` to `index + FDECK_N - 1` of a deck, given the capacity of its main duplex.
+ * They are written one after the other, XORed with `in` if there is one.
+ */
+FDECK_INLINE void
+FDECK_FN(output)(uint8_t *out, const uint8_t *in, const uint64_t *cap, uint64_t index,
+                 unsigned rate_lanes, unsigned rounds, uint8_t pad)
+{
+    const FDECK_V zero = FDECK_SET1(0);
+    FDECK_V       a[25];
+
+    a[0] = FDECK_COUNTERS(index);
+#    define FDECK_ZERO(lane)    \
+        do {                    \
+            a[lane]     = zero; \
+            a[lane + 1] = zero; \
+            a[lane + 2] = zero; \
+        } while (0)
+    FDECK_ZERO(1);
+    FDECK_ZERO(4);
+    FDECK_ZERO(7);
+    FDECK_ZERO(10);
+    FDECK_ZERO(13);
+    if (rate_lanes == 20) {
+        a[16] = zero;
+        FDECK_ZERO(17);
+    }
+#    undef FDECK_ZERO
+#    define FDECK_DO(lane) a[lane] = FDECK_SET1(cap[lane - rate_lanes])
+    FDECK_CAPACITY_LANES(rate_lanes, FDECK_DO);
+#    undef FDECK_DO
+    a[rate_lanes] =
+        FDECK_XOR(a[rate_lanes], FDECK_SET1(fdeck_trailer_lane(FDECK_TRAILER_COUNTER, 1, pad)));
+    FDECK_FN(permute)(a, rounds);
+    FDECK_FN(store_block)(out, in, a, rate_lanes);
+}
+
+#    undef FDECK_COUNTERS
+
+#    define FDECK_OUTPUT_FUNCTION(name, rate_lanes, rounds, pad)                              \
+        FDECK_TARGET static void FDECK_FN(name##_output)(uint8_t *out, const uint8_t *in,     \
+                                                         const uint64_t *cap, uint64_t index) \
+        {                                                                                     \
+            FDECK_FN(output)(out, in, cap, index, rate_lanes, rounds, pad);                   \
+        }
+
+#else
+#    define FDECK_OUTPUT_FUNCTION(name, rate_lanes, rounds, pad)
+#endif
+
 /* The functions of each instance: the ones above, with its parameters as constants. */
 #define FDECK_FUNCTIONS(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, pad)    \
     FDECK_TARGET static void FDECK_FN(name##_absorb)(                                          \
@@ -279,11 +410,13 @@ FDECK_FN(absorb)(uint64_t *caps, const uint8_t *const in[FDECK_N], size_t nblock
     {                                                                                          \
         FDECK_FN(absorb)(caps, in, nblocks, last, last_trailers, out, whole_state, rate_lanes, \
                          cv_lanes, rounds, pad);                                               \
-    }
+    }                                                                                          \
+    FDECK_OUTPUT_FUNCTION(name, rate_lanes, rounds, pad)
 
 FDECK_INSTANCES(FDECK_FUNCTIONS)
 
 #undef FDECK_FUNCTIONS
+#undef FDECK_OUTPUT_FUNCTION
 #undef FDECK_CAPACITY_LANES
 #undef FDECK_EACH_ROW
 #undef FDECK_ROW_OF

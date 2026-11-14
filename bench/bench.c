@@ -130,7 +130,7 @@ main(void)
     for (int s = 0; s < SIZES; s++) {
         printf("%10zu", sizes[s]);
     }
-    printf("\n");
+    printf("     (%s)\n", flightdeck_implementation());
 
     for (size_t op = 0; op < sizeof ops / sizeof ops[0]; op++) {
         for (size_t v = 0; v < sizeof names / sizeof names[0]; v++) {

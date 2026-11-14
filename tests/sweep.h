@@ -164,7 +164,7 @@ sweep_deck(int variant, uint8_t digest[32])
         const size_t len     = sweep_length(variant, i);
         const size_t key_len = i % 3 == 0 ? 0 : i % 33;
         const size_t out_len = i % 5 == 0 ? 1 + (i * 7) % 2000 : i % 70;
-        /* Every fifth step XORs 1 to 21 whole blocks from the start of the output. */
+        /* Every fifth step XORs 1 to 21 whole blocks from the start of the output, to go through each batch size of the backends. */
         const size_t squeezed = i % 5 == 0 ? 0 : i % 190;
         const size_t xored    = i % 5 == 0 ? rate * (1 + (i / 5) % 21) : 150 + i % 400;
         const size_t more     = 1 + i % 170;
