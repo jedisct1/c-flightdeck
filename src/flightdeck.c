@@ -10,6 +10,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__GNUC__) && !defined(__clang__)
+#    define FDECK_GCC 1
+#else
+#    define FDECK_GCC 0
+#endif
+
 /*
  * On x86-64, the AVX-512 backend is built along with the plain C one, and used when the CPU and operating system support it.
  * FLIGHTDECK_PORTABLE only builds the plain C backend.
@@ -272,6 +278,17 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 
 #    define FDECK_AVX512_TARGET __attribute__((target("avx512f,avx512vl,bmi,bmi2")))
 
+/*
+ * GCC rearranges the vector rounds in ways that make them slower, and two things stop it.
+ * FDECK_VECTOR_KEEP() makes it compute a value once and reuse it, instead of redoing the XOR at every use.
+ * And its last pass that reorders instructions is turned off, because it moves the rotations around.
+ */
+#    if FDECK_GCC
+#        define FDECK_VECTOR_KEEP(x) __asm__("" : "+v"(x))
+#        pragma GCC push_options
+#        pragma GCC optimize("no-schedule-insns2")
+#    endif
+
 /* With AVX-512, a single state is fastest with each lane in its own register. */
 #    define FDECK_N                 1
 #    define FDECK_V                 __m128i
@@ -299,6 +316,11 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #    define FDECK_LOAD_LANES(p)     _mm256_loadu_si256((const __m256i *) (p))
 #    define FDECK_STORE_LANES(p, v) _mm256_storeu_si256((__m256i *) (p), v)
 #    include "flightdeck_backend.inc"
+
+#    if FDECK_GCC
+#        pragma GCC pop_options
+#    endif
+#    undef FDECK_VECTOR_KEEP
 
 #    define FDECK_AVX512_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, \
                                   pad)                                                           \

@@ -5,6 +5,9 @@
  * Vector code also defines FDECK_V, FDECK_XOR(), FDECK_XOR3(), FDECK_CHI(), FDECK_ROL(), FDECK_SET1(), FDECK_LOAD_LANES() and FDECK_STORE_LANES(), plus FDECK_LOAD_BYTES() for a single state.
  * Without them, the code works on plain 64-bit words.
  *
+ * Optional settings:
+ * - FDECK_VECTOR_KEEP(), see flightdeck.c.
+ *
  * Loading and storing blocks is written for 4 states on x86.
  *
  * A vector holds the same lane of every state.
@@ -13,6 +16,12 @@
  *
  * Don't loop over the lanes of a state: if the compiler keeps the loop, it keeps the state in memory instead of registers.
  */
+
+#if defined(FDECK_V) && defined(FDECK_VECTOR_KEEP)
+#    define FDECK_KEEP(x) FDECK_VECTOR_KEEP(x)
+#else
+#    define FDECK_KEEP(x) ((void) 0)
+#endif
 
 #ifndef FDECK_V
 #    define FDECK_V                 uint64_t
@@ -35,6 +44,7 @@
 #define FDECK_THETA(d, x, previous, next)               \
     do {                                                \
         d[x] = FDECK_XOR(previous, FDECK_ROL(next, 1)); \
+        FDECK_KEEP(d[x]);                               \
     } while (0)
 
 /*
@@ -428,6 +438,7 @@ FDECK_INSTANCES(FDECK_FUNCTIONS)
 #undef FDECK_V
 #undef FDECK_FN
 #undef FDECK_TARGET
+#undef FDECK_KEEP
 #undef FDECK_XOR
 #undef FDECK_XOR3
 #undef FDECK_CHI
