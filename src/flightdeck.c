@@ -47,7 +47,7 @@
 #define FDECK_RATE_MAX           160
 #define FDECK_CAPACITY_LANES_MAX 9
 #define FDECK_CV_LANES_MAX       8
-#define FDECK_WIDTH_MAX          4
+#define FDECK_WIDTH_MAX          8
 
 /* Room for the chaining values waiting to be absorbed by the main duplex. */
 #define FDECK_PENDING_MAX 4096
@@ -317,6 +317,19 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #    define FDECK_STORE_LANES(p, v) _mm256_storeu_si256((__m256i *) (p), v)
 #    include "flightdeck_backend.inc"
 
+#    define FDECK_N                 8
+#    define FDECK_V                 __m512i
+#    define FDECK_FN(name)          fdeck_##name##_avx512_x8
+#    define FDECK_TARGET            FDECK_AVX512_TARGET
+#    define FDECK_XOR(a, b)         _mm512_xor_si512(a, b)
+#    define FDECK_XOR3(a, b, c)     _mm512_ternarylogic_epi64(a, b, c, 0x96)
+#    define FDECK_CHI(a, b, c)      _mm512_ternarylogic_epi64(a, b, c, 0xd2)
+#    define FDECK_ROL(a, n)         _mm512_rol_epi64(a, n)
+#    define FDECK_SET1(x)           _mm512_set1_epi64((long long) (x))
+#    define FDECK_LOAD_LANES(p)     _mm512_loadu_si512(p)
+#    define FDECK_STORE_LANES(p, v) _mm512_storeu_si512(p, v)
+#    include "flightdeck_backend.inc"
+
 #    if FDECK_GCC
 #        pragma GCC pop_options
 #    endif
@@ -330,7 +343,10 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
             blocks_per_chunk,                                                                    \
             pad,                                                                                 \
             fdeck_##name##_absorb_avx512_x1,                                                     \
-            { { 4, fdeck_##name##_absorb_avx512_x4, fdeck_##name##_output_avx512_x4 } },         \
+            {                                                                                    \
+                { 4, fdeck_##name##_absorb_avx512_x4, fdeck_##name##_output_avx512_x4 },         \
+                { 8, fdeck_##name##_absorb_avx512_x8, fdeck_##name##_output_avx512_x8 },         \
+            },                                                                                   \
         },
 
 /*

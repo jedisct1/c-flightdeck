@@ -8,7 +8,7 @@
  * Optional settings:
  * - FDECK_VECTOR_KEEP(), see flightdeck.c.
  *
- * Loading and storing blocks is written for 4 states on x86.
+ * Loading and storing blocks is written for 4 and 8 states on x86.
  *
  * A vector holds the same lane of every state.
  * A block overwrites the start of a state, so only the lanes after it, the capacity, carry over from one block to the next.
@@ -175,7 +175,149 @@ FDECK_FN(store_capacity)(uint64_t *caps, const FDECK_V a[25], unsigned rate_lane
 #undef FDECK_DO
 }
 
-#if FDECK_N == 4
+#if FDECK_N == 8
+
+/* Turn 8 rows of 8 lanes into 8 columns, or back. */
+FDECK_INLINE void
+FDECK_FN(transpose)(FDECK_V v[8])
+{
+    const FDECK_V t0 = _mm512_unpacklo_epi64(v[0], v[1]);
+    const FDECK_V t1 = _mm512_unpackhi_epi64(v[0], v[1]);
+    const FDECK_V t2 = _mm512_unpacklo_epi64(v[2], v[3]);
+    const FDECK_V t3 = _mm512_unpackhi_epi64(v[2], v[3]);
+    const FDECK_V t4 = _mm512_unpacklo_epi64(v[4], v[5]);
+    const FDECK_V t5 = _mm512_unpackhi_epi64(v[4], v[5]);
+    const FDECK_V t6 = _mm512_unpacklo_epi64(v[6], v[7]);
+    const FDECK_V t7 = _mm512_unpackhi_epi64(v[6], v[7]);
+    const FDECK_V u0 = _mm512_shuffle_i64x2(t0, t2, 0x88);
+    const FDECK_V u1 = _mm512_shuffle_i64x2(t0, t2, 0xdd);
+    const FDECK_V u2 = _mm512_shuffle_i64x2(t1, t3, 0x88);
+    const FDECK_V u3 = _mm512_shuffle_i64x2(t1, t3, 0xdd);
+    const FDECK_V u4 = _mm512_shuffle_i64x2(t4, t6, 0x88);
+    const FDECK_V u5 = _mm512_shuffle_i64x2(t4, t6, 0xdd);
+    const FDECK_V u6 = _mm512_shuffle_i64x2(t5, t7, 0x88);
+    const FDECK_V u7 = _mm512_shuffle_i64x2(t5, t7, 0xdd);
+
+    v[0] = _mm512_shuffle_i64x2(u0, u4, 0x88);
+    v[1] = _mm512_shuffle_i64x2(u2, u6, 0x88);
+    v[2] = _mm512_shuffle_i64x2(u1, u5, 0x88);
+    v[3] = _mm512_shuffle_i64x2(u3, u7, 0x88);
+    v[4] = _mm512_shuffle_i64x2(u0, u4, 0xdd);
+    v[5] = _mm512_shuffle_i64x2(u2, u6, 0xdd);
+    v[6] = _mm512_shuffle_i64x2(u1, u5, 0xdd);
+    v[7] = _mm512_shuffle_i64x2(u3, u7, 0xdd);
+}
+
+FDECK_INLINE FDECK_V
+FDECK_FN(load_pair)(const uint8_t *low, const uint8_t *high)
+{
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) low)),
+                              _mm256_loadu_si256((const __m256i *) high), 1);
+}
+
+/* Load the block of each state into its first lanes. */
+FDECK_INLINE void
+FDECK_FN(load_block)(FDECK_V a[25], const uint8_t *const in[8], unsigned rate_lanes)
+{
+#    define FDECK_ROWS(lane)                                    \
+        do {                                                    \
+            a[lane]     = _mm512_loadu_si512(in[0] + 8 * lane); \
+            a[lane + 1] = _mm512_loadu_si512(in[1] + 8 * lane); \
+            a[lane + 2] = _mm512_loadu_si512(in[2] + 8 * lane); \
+            a[lane + 3] = _mm512_loadu_si512(in[3] + 8 * lane); \
+            a[lane + 4] = _mm512_loadu_si512(in[4] + 8 * lane); \
+            a[lane + 5] = _mm512_loadu_si512(in[5] + 8 * lane); \
+            a[lane + 6] = _mm512_loadu_si512(in[6] + 8 * lane); \
+            a[lane + 7] = _mm512_loadu_si512(in[7] + 8 * lane); \
+            FDECK_FN(transpose)(a + lane);                      \
+        } while (0)
+    FDECK_ROWS(0);
+    FDECK_ROWS(8);
+#    undef FDECK_ROWS
+    if (rate_lanes == 20) {
+        /* Four lanes are left. Pairing the states this way only needs shuffles of 128-bit halves. */
+        const FDECK_V s02 = FDECK_FN(load_pair)(in[0] + 128, in[2] + 128);
+        const FDECK_V s13 = FDECK_FN(load_pair)(in[1] + 128, in[3] + 128);
+        const FDECK_V s46 = FDECK_FN(load_pair)(in[4] + 128, in[6] + 128);
+        const FDECK_V s57 = FDECK_FN(load_pair)(in[5] + 128, in[7] + 128);
+        const FDECK_V t0  = _mm512_unpacklo_epi64(s02, s13);
+        const FDECK_V t1  = _mm512_unpackhi_epi64(s02, s13);
+        const FDECK_V t2  = _mm512_unpacklo_epi64(s46, s57);
+        const FDECK_V t3  = _mm512_unpackhi_epi64(s46, s57);
+
+        a[16] = _mm512_shuffle_i64x2(t0, t2, 0x88);
+        a[17] = _mm512_shuffle_i64x2(t1, t3, 0x88);
+        a[18] = _mm512_shuffle_i64x2(t0, t2, 0xdd);
+        a[19] = _mm512_shuffle_i64x2(t1, t3, 0xdd);
+    }
+}
+
+/*
+ * Write the block of each state, one state after the other, XORed with `in` if there is one.
+ * This overwrites the block in `a`.
+ */
+FDECK_INLINE void
+FDECK_FN(store_block)(uint8_t *out, const uint8_t *in, FDECK_V a[25], unsigned rate_lanes)
+{
+    const size_t rate = 8 * (size_t) rate_lanes;
+
+#    define FDECK_ROW_OUT(lane, i)                                                         \
+        do {                                                                               \
+            FDECK_V row = a[lane + i];                                                     \
+            if (in != NULL) {                                                              \
+                row = _mm512_xor_si512(row, _mm512_loadu_si512(in + i * rate + 8 * lane)); \
+            }                                                                              \
+            _mm512_storeu_si512(out + i * rate + 8 * lane, row);                           \
+        } while (0)
+#    define FDECK_ROWS(lane)               \
+        do {                               \
+            FDECK_FN(transpose)(a + lane); \
+            FDECK_ROW_OUT(lane, 0);        \
+            FDECK_ROW_OUT(lane, 1);        \
+            FDECK_ROW_OUT(lane, 2);        \
+            FDECK_ROW_OUT(lane, 3);        \
+            FDECK_ROW_OUT(lane, 4);        \
+            FDECK_ROW_OUT(lane, 5);        \
+            FDECK_ROW_OUT(lane, 6);        \
+            FDECK_ROW_OUT(lane, 7);        \
+        } while (0)
+    FDECK_ROWS(0);
+    FDECK_ROWS(8);
+#    undef FDECK_ROWS
+#    undef FDECK_ROW_OUT
+    if (rate_lanes == 20) {
+        const FDECK_V t0   = _mm512_unpacklo_epi64(a[16], a[17]);
+        const FDECK_V t1   = _mm512_unpackhi_epi64(a[16], a[17]);
+        const FDECK_V t2   = _mm512_unpacklo_epi64(a[18], a[19]);
+        const FDECK_V t3   = _mm512_unpackhi_epi64(a[18], a[19]);
+        const FDECK_V low  = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+        const FDECK_V high = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+
+/* `pair` holds the last four lanes of the states `i` and `j`. */
+#    define FDECK_PAIR_OUT(pair, i, j)                                                             \
+        do {                                                                                       \
+            FDECK_V rows = pair;                                                                   \
+            if (in != NULL) {                                                                      \
+                rows = _mm512_xor_si512(                                                           \
+                    rows, FDECK_FN(load_pair)(in + i * rate + 128, in + j * rate + 128));          \
+            }                                                                                      \
+            _mm256_storeu_si256((__m256i *) (out + i * rate + 128), _mm512_castsi512_si256(rows)); \
+            _mm256_storeu_si256((__m256i *) (out + j * rate + 128),                                \
+                                _mm512_extracti64x4_epi64(rows, 1));                               \
+        } while (0)
+        FDECK_PAIR_OUT(_mm512_permutex2var_epi64(t0, low, t2), 0, 2);
+        FDECK_PAIR_OUT(_mm512_permutex2var_epi64(t1, low, t3), 1, 3);
+        FDECK_PAIR_OUT(_mm512_permutex2var_epi64(t0, high, t2), 4, 6);
+        FDECK_PAIR_OUT(_mm512_permutex2var_epi64(t1, high, t3), 5, 7);
+#    undef FDECK_PAIR_OUT
+    }
+}
+
+#    define FDECK_COUNTERS(index)                                \
+        _mm512_add_epi64(_mm512_set1_epi64((long long) (index)), \
+                         _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7))
+
+#elif FDECK_N == 4
 
 FDECK_INLINE void
 FDECK_FN(transpose)(FDECK_V v[4])
