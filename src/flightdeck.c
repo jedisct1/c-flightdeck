@@ -47,7 +47,7 @@
 #define FDECK_RATE_MAX           160
 #define FDECK_CAPACITY_LANES_MAX 9
 #define FDECK_CV_LANES_MAX       8
-#define FDECK_WIDTH_MAX          8
+#define FDECK_WIDTH_MAX          9
 
 /* Room for the chaining values waiting to be absorbed by the main duplex. */
 #define FDECK_PENDING_MAX 4096
@@ -317,10 +317,15 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #    define FDECK_STORE_LANES(p, v) _mm256_storeu_si256((__m256i *) (p), v)
 #    include "flightdeck_backend.inc"
 
+/*
+ * With GCC, a batch of eight states can take a ninth one on plain 64-bit words, nearly for free.
+ * Clang compiles that code in a way that makes it slower, so it's GCC only.
+ */
 #    define FDECK_N                 8
 #    define FDECK_V                 __m512i
 #    define FDECK_FN(name)          fdeck_##name##_avx512_x8
 #    define FDECK_TARGET            FDECK_AVX512_TARGET
+#    define FDECK_NINTH_STATE       FDECK_GCC
 #    define FDECK_XOR(a, b)         _mm512_xor_si512(a, b)
 #    define FDECK_XOR3(a, b, c)     _mm512_ternarylogic_epi64(a, b, c, 0x96)
 #    define FDECK_CHI(a, b, c)      _mm512_ternarylogic_epi64(a, b, c, 0xd2)
@@ -335,6 +340,12 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #    endif
 #    undef FDECK_VECTOR_KEEP
 
+#    if FDECK_GCC
+#        define FDECK_NINTH_BATCH(name) { 9, fdeck_##name##_absorb9_avx512_x8, NULL },
+#    else
+#        define FDECK_NINTH_BATCH(name)
+#    endif
+
 #    define FDECK_AVX512_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, \
                                   pad)                                                           \
         [variant] = {                                                                            \
@@ -343,10 +354,9 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
             blocks_per_chunk,                                                                    \
             pad,                                                                                 \
             fdeck_##name##_absorb_avx512_x1,                                                     \
-            {                                                                                    \
-                { 4, fdeck_##name##_absorb_avx512_x4, fdeck_##name##_output_avx512_x4 },         \
-                { 8, fdeck_##name##_absorb_avx512_x8, fdeck_##name##_output_avx512_x8 },         \
-            },                                                                                   \
+            { { 4, fdeck_##name##_absorb_avx512_x4, fdeck_##name##_output_avx512_x4 },           \
+              { 8, fdeck_##name##_absorb_avx512_x8, fdeck_##name##_output_avx512_x8 },           \
+              FDECK_NINTH_BATCH(name) },                                                         \
         },
 
 /*
@@ -444,13 +454,14 @@ fdeck_capacity_len(fdeck_instance *im)
 }
 
 /*
- * The batch for `count` chunks, or for `count` output blocks if `for_output` is set.
+ * The batch for `count` chunks plus a shorter last one if `tail` is set, or for `count` output blocks if `for_output` is set.
  *
  * That's the smallest batch that fits `count`, or the largest one if none does, since bigger batches cost more.
  * So a shorter last chunk only gets a slot that would be unused otherwise.
+ * The exception is a batch with exactly one more slot for it, which is the nearly free ninth state.
  */
 static const fdeck_batch *
-fdeck_batch_for(fdeck_instance *im, size_t count, int for_output)
+fdeck_batch_for(fdeck_instance *im, size_t count, int tail, int for_output)
 {
     const fdeck_batch *best = NULL;
 
@@ -458,7 +469,7 @@ fdeck_batch_for(fdeck_instance *im, size_t count, int for_output)
         if (for_output && batch->output == NULL) {
             continue;
         }
-        if (best == NULL || best->width < count) {
+        if (best == NULL || best->width < count || (tail && batch->width == count + 1)) {
             best = batch;
         }
     }
@@ -606,7 +617,7 @@ fdeck_absorb_chunks(fdeck_instance *im, uint64_t *cap, const uint8_t *in, size_t
     for (;;) {
         const size_t       full     = len / chunk;
         const size_t       tail_len = len % chunk;
-        const fdeck_batch *batch    = fdeck_batch_for(im, full, 0);
+        const fdeck_batch *batch    = fdeck_batch_for(im, full, tail_len != 0, 0);
         const uint8_t     *blocks[FDECK_WIDTH_MAX];
         const uint8_t     *last_blocks[FDECK_WIDTH_MAX];
         uint64_t           trailers[FDECK_WIDTH_MAX];
@@ -758,7 +769,7 @@ fdeck_output(flightdeck *deck, uint8_t *out, const uint8_t *in, size_t len)
     while (i < len) {
         const size_t       left   = len - i;
         const size_t       needed = left / rate + (left % rate != 0);
-        const fdeck_batch *batch  = needed < 2 ? NULL : fdeck_batch_for(im, needed, 1);
+        const fdeck_batch *batch  = needed < 2 ? NULL : fdeck_batch_for(im, needed, 0, 1);
         const uint64_t     index  = offset / rate;
         size_t             n;
 

@@ -6,6 +6,7 @@
  * Without them, the code works on plain 64-bit words.
  *
  * Optional settings:
+ * - FDECK_NINTH_STATE, to run a ninth state on plain 64-bit words next to eight in vectors.
  * - FDECK_VECTOR_KEEP(), see flightdeck.c.
  *
  * Loading and storing blocks is written for 4 and 8 states on x86.
@@ -33,6 +34,10 @@
 #    define FDECK_LOAD_LANES(p)     (*(p))
 #    define FDECK_STORE_LANES(p, v) (*(p) = (v))
 #    define FDECK_LOAD_BYTES(p)     fdeck_load_lane(p)
+#endif
+
+#ifndef FDECK_NINTH_STATE
+#    define FDECK_NINTH_STATE 0
 #endif
 
 #define FDECK_INLINE FDECK_ALWAYS_INLINE FDECK_TARGET
@@ -502,6 +507,163 @@ FDECK_FN(absorb)(uint64_t *caps, const uint8_t *const in[FDECK_N], size_t nblock
     FDECK_FN(store_capacity)(caps, a, rate_lanes);
 }
 
+#if FDECK_NINTH_STATE
+
+/*
+ * One round on eight states in vectors and a ninth one on plain 64-bit words.
+ *
+ * The vector code leaves the CPU's integer units idle, so the ninth state is nearly free.
+ * The rows of the two are interleaved, otherwise the CPU doesn't run them side by side.
+ */
+FDECK_INLINE void
+FDECK_FN(round9)(FDECK_V a[25], uint64_t ninth[25], uint64_t round_constant)
+{
+    const FDECK_V  c0       = FDECK_PARITY(a, 0);
+    const FDECK_V  c1       = FDECK_PARITY(a, 1);
+    const FDECK_V  c2       = FDECK_PARITY(a, 2);
+    const FDECK_V  c3       = FDECK_PARITY(a, 3);
+    const FDECK_V  c4       = FDECK_PARITY(a, 4);
+    const uint64_t ninth_c0 = ninth[0] ^ ninth[5] ^ ninth[10] ^ ninth[15] ^ ninth[20];
+    const uint64_t ninth_c1 = ninth[1] ^ ninth[6] ^ ninth[11] ^ ninth[16] ^ ninth[21];
+    const uint64_t ninth_c2 = ninth[2] ^ ninth[7] ^ ninth[12] ^ ninth[17] ^ ninth[22];
+    const uint64_t ninth_c3 = ninth[3] ^ ninth[8] ^ ninth[13] ^ ninth[18] ^ ninth[23];
+    const uint64_t ninth_c4 = ninth[4] ^ ninth[9] ^ ninth[14] ^ ninth[19] ^ ninth[24];
+    FDECK_V        d[5];
+    FDECK_V        e[25];
+    uint64_t       ninth_d[5];
+    uint64_t       ninth_e[25];
+
+    FDECK_THETA(d, 0, c4, c1);
+    FDECK_THETA(d, 2, c1, c3);
+    FDECK_THETA(d, 4, c3, c0);
+    FDECK_THETA(d, 1, c0, c2);
+    FDECK_THETA(d, 3, c2, c4);
+    ninth_d[0] = ninth_c4 ^ fdeck_rotl(ninth_c1, 1);
+    ninth_d[1] = ninth_c0 ^ fdeck_rotl(ninth_c2, 1);
+    ninth_d[2] = ninth_c1 ^ fdeck_rotl(ninth_c3, 1);
+    ninth_d[3] = ninth_c2 ^ fdeck_rotl(ninth_c4, 1);
+    ninth_d[4] = ninth_c3 ^ fdeck_rotl(ninth_c0, 1);
+
+    a[0]  = FDECK_XOR(a[0], d[0]);
+    a[5]  = FDECK_XOR(a[5], d[0]);
+    a[10] = FDECK_XOR(a[10], d[0]);
+    a[15] = FDECK_XOR(a[15], d[0]);
+    a[20] = FDECK_XOR(a[20], d[0]);
+    ninth[0] ^= ninth_d[0];
+    ninth[5] ^= ninth_d[0];
+    ninth[10] ^= ninth_d[0];
+    ninth[15] ^= ninth_d[0];
+    ninth[20] ^= ninth_d[0];
+
+#    define FDECK_ROW(y, ...)                                                                  \
+        do {                                                                                   \
+            FDECK_ROW_OF(FDECK_V, FDECK_XOR, FDECK_ROL, FDECK_CHI, e, a, d, y, __VA_ARGS__);   \
+            FDECK_ROW_OF(uint64_t, FDECK_WORD_XOR, fdeck_rotl, FDECK_WORD_CHI, ninth_e, ninth, \
+                         ninth_d, y, __VA_ARGS__);                                             \
+        } while (0)
+    FDECK_EACH_ROW(FDECK_ROW);
+#    undef FDECK_ROW
+
+    e[0] = FDECK_XOR(e[0], FDECK_SET1(round_constant));
+    ninth_e[0] ^= round_constant;
+    memcpy(a, e, sizeof e);
+    memcpy(ninth, ninth_e, sizeof ninth_e);
+}
+
+/*
+ * absorb() for nine states.
+ * Their lanes are at `caps[9 * lane + state]` and go to `out[9 * lane + state]`.
+ */
+FDECK_INLINE void
+FDECK_FN(absorb9)(uint64_t *caps, const uint8_t *const in[9], size_t nblocks,
+                  const uint8_t *const last[9], const uint64_t *last_trailers, uint64_t *out,
+                  unsigned rate_lanes, unsigned cv_lanes, unsigned rounds, uint8_t pad)
+{
+    const size_t   rate  = 8 * (size_t) rate_lanes;
+    const size_t   total = nblocks + (last != NULL);
+    const uint8_t *blocks[9];
+    FDECK_V        trailer       = FDECK_SET1(fdeck_trailer_lane(FLIGHTDECK_TRAILER_EMPTY, 1, pad));
+    uint64_t       ninth_trailer = fdeck_trailer_lane(FLIGHTDECK_TRAILER_EMPTY, 1, pad);
+    FDECK_V        a[25];
+    uint64_t       ninth[25];
+
+    memcpy(blocks, in, sizeof blocks);
+#    define FDECK_DO(lane)                                                  \
+        do {                                                                \
+            a[lane]     = FDECK_LOAD_LANES(caps + 9 * (lane - rate_lanes)); \
+            ninth[lane] = caps[9 * (lane - rate_lanes) + 8];                \
+        } while (0)
+    FDECK_CAPACITY_LANES(rate_lanes, FDECK_DO);
+#    undef FDECK_DO
+    for (size_t i = 0; i < total; i++) {
+        if (i == nblocks) {
+            memcpy(blocks, last, sizeof blocks);
+            trailer       = FDECK_LOAD_LANES(last_trailers);
+            ninth_trailer = last_trailers[8];
+        }
+        FDECK_FN(load_block)(a, blocks, rate_lanes);
+        fdeck_load_block_c(ninth, blocks + 8, rate_lanes);
+        a[rate_lanes] = FDECK_XOR(a[rate_lanes], trailer);
+        ninth[rate_lanes] ^= ninth_trailer;
+
+        for (unsigned first = 24 - rounds; first < 22; first += 2) {
+            FDECK_FN(round9)(a, ninth, fdeck_round_constants[first]);
+            FDECK_FN(round9)(a, ninth, fdeck_round_constants[first + 1]);
+        }
+        FDECK_FN(round9)(a, ninth, fdeck_round_constants[22]);
+        FDECK_FN(round9)(a, ninth, fdeck_round_constants[23]);
+
+        blocks[0] += rate;
+        blocks[1] += rate;
+        blocks[2] += rate;
+        blocks[3] += rate;
+        blocks[4] += rate;
+        blocks[5] += rate;
+        blocks[6] += rate;
+        blocks[7] += rate;
+        blocks[8] += rate;
+
+        if (i == nblocks) {
+#    define FDECK_DO(lane)                              \
+        do {                                            \
+            FDECK_STORE_LANES(out + 9 * lane, a[lane]); \
+            out[9 * lane + 8] = ninth[lane];            \
+        } while (0)
+            FDECK_DO(0);
+            FDECK_DO(1);
+            FDECK_DO(2);
+            FDECK_DO(3);
+            if (cv_lanes == 8) {
+                FDECK_DO(4);
+                FDECK_DO(5);
+                FDECK_DO(6);
+                FDECK_DO(7);
+            }
+#    undef FDECK_DO
+        }
+    }
+#    define FDECK_DO(lane)                                              \
+        do {                                                            \
+            FDECK_STORE_LANES(caps + 9 * (lane - rate_lanes), a[lane]); \
+            caps[9 * (lane - rate_lanes) + 8] = ninth[lane];            \
+        } while (0)
+    FDECK_CAPACITY_LANES(rate_lanes, FDECK_DO);
+#    undef FDECK_DO
+}
+
+#    define FDECK_ABSORB9_FUNCTION(name, rate_lanes, cv_lanes, rounds, pad)                       \
+        FDECK_TARGET static void FDECK_FN(name##_absorb9)(                                        \
+            uint64_t *caps, const uint8_t *const *in, size_t nblocks, const uint8_t *const *last, \
+            const uint64_t *last_trailers, uint64_t *out, int whole_state)                        \
+        {                                                                                         \
+            (void) whole_state;                                                                   \
+            FDECK_FN(absorb9)(caps, in, nblocks, last, last_trailers, out, rate_lanes, cv_lanes,  \
+                              rounds, pad);                                                       \
+        }
+#else
+#    define FDECK_ABSORB9_FUNCTION(name, rate_lanes, cv_lanes, rounds, pad)
+#endif
+
 #if FDECK_N > 1
 
 /*
@@ -563,11 +725,13 @@ FDECK_FN(output)(uint8_t *out, const uint8_t *in, const uint64_t *cap, uint64_t 
         FDECK_FN(absorb)(caps, in, nblocks, last, last_trailers, out, whole_state, rate_lanes, \
                          cv_lanes, rounds, pad);                                               \
     }                                                                                          \
-    FDECK_OUTPUT_FUNCTION(name, rate_lanes, rounds, pad)
+    FDECK_OUTPUT_FUNCTION(name, rate_lanes, rounds, pad)                                       \
+    FDECK_ABSORB9_FUNCTION(name, rate_lanes, cv_lanes, rounds, pad)
 
 FDECK_INSTANCES(FDECK_FUNCTIONS)
 
 #undef FDECK_FUNCTIONS
+#undef FDECK_ABSORB9_FUNCTION
 #undef FDECK_OUTPUT_FUNCTION
 #undef FDECK_CAPACITY_LANES
 #undef FDECK_EACH_ROW
@@ -589,3 +753,4 @@ FDECK_INSTANCES(FDECK_FUNCTIONS)
 #undef FDECK_LOAD_LANES
 #undef FDECK_STORE_LANES
 #undef FDECK_LOAD_BYTES
+#undef FDECK_NINTH_STATE
