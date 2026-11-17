@@ -1,7 +1,7 @@
 /*
  * Tests for the overwrite duplex, FlightDeck and Deck-BO.
  *
- * `make test` builds this file twice: with the best backend for the CPU, and with the plain C code only.
+ * `make test` builds this file three times: with the best backend for the CPU, without AVX-512, and with the plain C code only.
  */
 
 #define _DEFAULT_SOURCE
@@ -414,12 +414,19 @@ test_parameters(void)
     CHECK(strcmp(flightdeck_implementation(), "portable") == 0);
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     /*
-     * When the compiler's runtime sees AVX-512, the library has to use it too.
+     * When the compiler's runtime sees AVX2 or AVX-512, the library has to use it too.
      * The reverse isn't checked, because with some C runtimes the builtin always says no.
      */
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") &&
-        __builtin_cpu_supports("bmi") && __builtin_cpu_supports("bmi2")) {
-        CHECK(strcmp(flightdeck_implementation(), "avx512") == 0);
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi") &&
+        __builtin_cpu_supports("bmi2")) {
+        const char *expected = "avx2";
+
+#    ifndef FLIGHTDECK_NO_AVX512
+        if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl")) {
+            expected = "avx512";
+        }
+#    endif
+        CHECK(strcmp(flightdeck_implementation(), expected) == 0);
     }
 #endif
 }

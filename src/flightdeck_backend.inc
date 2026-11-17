@@ -6,6 +6,7 @@
  * Without them, the code works on plain 64-bit words.
  *
  * Optional settings:
+ * - FDECK_PARITY_BY_ROW, when there aren't enough vector registers for one per lane.
  * - FDECK_NINTH_STATE, to run a ninth state on plain 64-bit words next to eight in vectors.
  * - FDECK_VECTOR_KEEP(), see flightdeck.c.
  *
@@ -36,6 +37,9 @@
 #    define FDECK_LOAD_BYTES(p)     fdeck_load_lane(p)
 #endif
 
+#ifndef FDECK_PARITY_BY_ROW
+#    define FDECK_PARITY_BY_ROW 0
+#endif
 #ifndef FDECK_NINTH_STATE
 #    define FDECK_NINTH_STATE 0
 #endif
@@ -92,6 +96,7 @@
  *
  * The order of the steps is the fastest one we measured.
  * Theta goes to the first column up front, so that 32 registers are enough for the rest.
+ * With 16 registers, FDECK_PARITY_BY_ROW adds each row to the parities while it's still in registers.
  */
 FDECK_INLINE void
 FDECK_FN(round)(FDECK_V a[25], FDECK_V c[5], uint64_t round_constant)
@@ -111,17 +116,33 @@ FDECK_FN(round)(FDECK_V a[25], FDECK_V c[5], uint64_t round_constant)
     a[15] = FDECK_XOR(a[15], d[0]);
     a[20] = FDECK_XOR(a[20], d[0]);
 
-#define FDECK_ROW(y, ...) \
-    FDECK_ROW_OF(FDECK_V, FDECK_XOR, FDECK_ROL, FDECK_CHI, e, a, d, y, __VA_ARGS__)
+#define FDECK_ROW(y, ...)                                                                \
+    do {                                                                                 \
+        FDECK_ROW_OF(FDECK_V, FDECK_XOR, FDECK_ROL, FDECK_CHI, e, a, d, y, __VA_ARGS__); \
+        if (FDECK_PARITY_BY_ROW) {                                                       \
+            if (y == 0) {                                                                \
+                e[0] = FDECK_XOR(e[0], FDECK_SET1(round_constant));                      \
+                memcpy(c, e, 5 * sizeof e[0]);                                           \
+            } else {                                                                     \
+                c[0] = FDECK_XOR(c[0], e[5 * y]);                                        \
+                c[1] = FDECK_XOR(c[1], e[5 * y + 1]);                                    \
+                c[2] = FDECK_XOR(c[2], e[5 * y + 2]);                                    \
+                c[3] = FDECK_XOR(c[3], e[5 * y + 3]);                                    \
+                c[4] = FDECK_XOR(c[4], e[5 * y + 4]);                                    \
+            }                                                                            \
+        }                                                                                \
+    } while (0)
     FDECK_EACH_ROW(FDECK_ROW);
 #undef FDECK_ROW
 
-    e[0] = FDECK_XOR(e[0], FDECK_SET1(round_constant));
-    c[0] = FDECK_PARITY(e, 0);
-    c[1] = FDECK_PARITY(e, 1);
-    c[2] = FDECK_PARITY(e, 2);
-    c[3] = FDECK_PARITY(e, 3);
-    c[4] = FDECK_PARITY(e, 4);
+    if (!FDECK_PARITY_BY_ROW) {
+        e[0] = FDECK_XOR(e[0], FDECK_SET1(round_constant));
+        c[0] = FDECK_PARITY(e, 0);
+        c[1] = FDECK_PARITY(e, 1);
+        c[2] = FDECK_PARITY(e, 2);
+        c[3] = FDECK_PARITY(e, 3);
+        c[4] = FDECK_PARITY(e, 4);
+    }
     memcpy(a, e, sizeof e);
 }
 
@@ -753,4 +774,5 @@ FDECK_INSTANCES(FDECK_FUNCTIONS)
 #undef FDECK_LOAD_LANES
 #undef FDECK_STORE_LANES
 #undef FDECK_LOAD_BYTES
+#undef FDECK_PARITY_BY_ROW
 #undef FDECK_NINTH_STATE

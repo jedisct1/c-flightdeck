@@ -17,8 +17,8 @@
 #endif
 
 /*
- * On x86-64, the AVX-512 backend is built along with the plain C one, and used when the CPU and operating system support it.
- * FLIGHTDECK_PORTABLE only builds the plain C backend.
+ * On x86-64, the AVX2 and AVX-512 backends are built along with the plain C one, and the best one the CPU and operating system support is picked at run time.
+ * FLIGHTDECK_PORTABLE only builds the plain C backend, and FLIGHTDECK_NO_AVX512 leaves AVX-512 out.
  */
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && \
     !defined(FLIGHTDECK_PORTABLE)
@@ -272,11 +272,22 @@ typedef const struct flightdeck_instance fdeck_instance;
     [variant] = { rate_lanes,           cv_lanes, blocks_per_chunk, pad, fdeck_##name##_absorb_c, \
                   { { 0, NULL, NULL } } },
 
-enum { FDECK_PORTABLE, FDECK_AVX512 };
+enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512 };
 
 #if FDECK_X86
 
+/* BMI helps the code that runs a single state on plain 64-bit words. */
+#    define FDECK_AVX2_TARGET   __attribute__((target("avx2,bmi,bmi2")))
 #    define FDECK_AVX512_TARGET __attribute__((target("avx512f,avx512vl,bmi,bmi2")))
+
+/*
+ * With AVX2, a single state is fastest on plain 64-bit words, since there aren't enough vector registers to give each lane its own.
+ * It's the plain C code again, compiled with BMI.
+ */
+#    define FDECK_N        1
+#    define FDECK_FN(name) fdeck_##name##_avx2_x1
+#    define FDECK_TARGET   FDECK_AVX2_TARGET
+#    include "flightdeck_backend.inc"
 
 /*
  * GCC rearranges the vector rounds in ways that make them slower, and two things stop it.
@@ -288,6 +299,20 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #        pragma GCC push_options
 #        pragma GCC optimize("no-schedule-insns2")
 #    endif
+
+#    define FDECK_N             4
+#    define FDECK_V             __m256i
+#    define FDECK_FN(name)      fdeck_##name##_avx2_x4
+#    define FDECK_TARGET        FDECK_AVX2_TARGET
+#    define FDECK_PARITY_BY_ROW 1
+#    define FDECK_XOR(a, b)     _mm256_xor_si256(a, b)
+#    define FDECK_XOR3(a, b, c) _mm256_xor_si256(_mm256_xor_si256(a, b), c)
+#    define FDECK_CHI(a, b, c)  _mm256_xor_si256(a, _mm256_andnot_si256(b, c))
+#    define FDECK_ROL(a, n) _mm256_or_si256(_mm256_slli_epi64(a, n), _mm256_srli_epi64(a, 64 - (n)))
+#    define FDECK_SET1(x)   _mm256_set1_epi64x((long long) (x))
+#    define FDECK_LOAD_LANES(p)     _mm256_loadu_si256((const __m256i *) (p))
+#    define FDECK_STORE_LANES(p, v) _mm256_storeu_si256((__m256i *) (p), v)
+#    include "flightdeck_backend.inc"
 
 /* With AVX-512, a single state is fastest with each lane in its own register. */
 #    define FDECK_N                 1
@@ -340,6 +365,17 @@ enum { FDECK_PORTABLE, FDECK_AVX512 };
 #    endif
 #    undef FDECK_VECTOR_KEEP
 
+#    define FDECK_AVX2_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, \
+                                pad)                                                           \
+        [variant] = {                                                                          \
+            rate_lanes,                                                                        \
+            cv_lanes,                                                                          \
+            blocks_per_chunk,                                                                  \
+            pad,                                                                               \
+            fdeck_##name##_absorb_avx2_x1,                                                     \
+            { { 4, fdeck_##name##_absorb_avx2_x4, fdeck_##name##_output_avx2_x4 } },           \
+        },
+
 #    if FDECK_GCC
 #        define FDECK_NINTH_BATCH(name) { 9, fdeck_##name##_absorb9_avx512_x8, NULL },
 #    else
@@ -373,14 +409,18 @@ fdeck_detect_backend(void)
         (ecx & bit_AVX) == 0) {
         return FDECK_PORTABLE;
     }
-    /* The operating system also has to save the 512-bit and mask registers. */
+    /* The operating system also has to save the 256-bit registers, and for AVX-512 the 512-bit and mask registers. */
     saved = (unsigned) _xgetbv(0);
-    if ((saved & 0xe6) != 0xe6 || !__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) ||
-        (ebx & bit_BMI) == 0 || (ebx & bit_BMI2) == 0 || (ebx & bit_AVX512F) == 0 ||
-        (ebx & bit_AVX512VL) == 0) {
+    if ((saved & 0x06) != 0x06 || !__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) ||
+        (ebx & bit_AVX2) == 0 || (ebx & bit_BMI) == 0 || (ebx & bit_BMI2) == 0) {
         return FDECK_PORTABLE;
     }
-    return FDECK_AVX512;
+#    ifndef FLIGHTDECK_NO_AVX512
+    if ((saved & 0xe6) == 0xe6 && (ebx & bit_AVX512F) != 0 && (ebx & bit_AVX512VL) != 0) {
+        return FDECK_AVX512;
+    }
+#    endif
+    return FDECK_AVX2;
 }
 
 #endif
@@ -391,6 +431,7 @@ static const struct fdeck_backend {
 } fdeck_backends[] = {
     [FDECK_PORTABLE] = { "portable", { FDECK_INSTANCES(FDECK_C_INSTANCE) } },
 #if FDECK_X86
+    [FDECK_AVX2]   = { "avx2", { FDECK_INSTANCES(FDECK_AVX2_INSTANCE) } },
     [FDECK_AVX512] = { "avx512", { FDECK_INSTANCES(FDECK_AVX512_INSTANCE) } },
 #endif
 };
