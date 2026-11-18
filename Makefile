@@ -30,9 +30,9 @@ test: build/test build/test_avx2 build/test_portable
 	./build/test_avx2
 	./build/test_portable
 
-# Runs the tests on WebAssembly, under wasmer.
+# Runs the tests on WebAssembly with SIMD, under wasmer.
 # tests/wasm has the few C library functions they need.
-WASM_CC ?= zig cc -target wasm32-freestanding -mcpu=lime1
+WASM_CC ?= zig cc -target wasm32-freestanding -mcpu=lime1+simd128
 WASM_RUN ?= wasmer run
 
 build/test.wasm: tests/test.c tests/sweep.h $(wildcard tests/wasm/*) $(SOURCES) | build

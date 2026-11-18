@@ -30,6 +30,14 @@
 #    define FDECK_X86 0
 #endif
 
+/* WebAssembly can't check for SIMD at run time, so it's used whenever the compiler was told to. */
+#if defined(__wasm_simd128__) && !defined(FLIGHTDECK_PORTABLE)
+#    define FDECK_SIMD128 1
+#    include <wasm_simd128.h>
+#else
+#    define FDECK_SIMD128 0
+#endif
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #    define FDECK_LITTLE_ENDIAN 1
 #else
@@ -272,7 +280,7 @@ typedef const struct flightdeck_instance fdeck_instance;
     [variant] = { rate_lanes,           cv_lanes, blocks_per_chunk, pad, fdeck_##name##_absorb_c, \
                   { { 0, NULL, NULL } } },
 
-enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512 };
+enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512, FDECK_WASM_SIMD128 };
 
 #if FDECK_X86
 
@@ -425,6 +433,40 @@ fdeck_detect_backend(void)
 
 #endif
 
+#if FDECK_SIMD128
+
+/*
+ * Two states at once in 128-bit vectors.
+ * A single state is faster on plain 64-bit words.
+ * One round per loop iteration works best with Cranelift, the default compiler of wasmtime and wasmer.
+ */
+#    define FDECK_N        2
+#    define FDECK_V        v128_t
+#    define FDECK_FN(name) fdeck_##name##_simd128_x2
+#    define FDECK_TARGET
+#    define FDECK_ROUNDS_PER_PASS   1
+#    define FDECK_XOR(a, b)         wasm_v128_xor(a, b)
+#    define FDECK_XOR3(a, b, c)     wasm_v128_xor(wasm_v128_xor(a, b), c)
+#    define FDECK_CHI(a, b, c)      wasm_v128_xor(a, wasm_v128_andnot(c, b))
+#    define FDECK_ROL(a, n)         wasm_v128_or(wasm_i64x2_shl(a, n), wasm_u64x2_shr(a, 64 - (n)))
+#    define FDECK_SET1(x)           wasm_i64x2_splat((int64_t) (x))
+#    define FDECK_LOAD_LANES(p)     wasm_v128_load(p)
+#    define FDECK_STORE_LANES(p, v) wasm_v128_store(p, v)
+#    include "flightdeck_backend.inc"
+
+#    define FDECK_SIMD128_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds, \
+                                   pad)                                                           \
+        [variant] = {                                                                             \
+            rate_lanes,                                                                           \
+            cv_lanes,                                                                             \
+            blocks_per_chunk,                                                                     \
+            pad,                                                                                  \
+            fdeck_##name##_absorb_c,                                                              \
+            { { 2, fdeck_##name##_absorb_simd128_x2, fdeck_##name##_output_simd128_x2 } },        \
+        },
+
+#endif
+
 static const struct fdeck_backend {
     const char                *name;
     struct flightdeck_instance instances[4];
@@ -433,6 +475,9 @@ static const struct fdeck_backend {
 #if FDECK_X86
     [FDECK_AVX2]   = { "avx2", { FDECK_INSTANCES(FDECK_AVX2_INSTANCE) } },
     [FDECK_AVX512] = { "avx512", { FDECK_INSTANCES(FDECK_AVX512_INSTANCE) } },
+#endif
+#if FDECK_SIMD128
+    [FDECK_WASM_SIMD128] = { "simd128", { FDECK_INSTANCES(FDECK_SIMD128_INSTANCE) } },
 #endif
 };
 
@@ -450,6 +495,8 @@ fdeck_backend_id(void)
         atomic_store_explicit(&cached, backend, memory_order_relaxed);
     }
     return backend;
+#elif FDECK_SIMD128
+    return FDECK_WASM_SIMD128;
 #else
     return FDECK_PORTABLE;
 #endif

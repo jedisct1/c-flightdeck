@@ -2,7 +2,7 @@
  * Tests for the overwrite duplex, FlightDeck and Deck-BO.
  *
  * `make test` builds this file three times: with the best backend for the CPU, without AVX-512, and with the plain C code only.
- * `make test-wasm` builds it once more, for WebAssembly.
+ * `make test-wasm` builds it once more, for WebAssembly with SIMD.
  */
 
 #define _DEFAULT_SOURCE
@@ -413,6 +413,8 @@ test_parameters(void)
 
 #ifdef FLIGHTDECK_PORTABLE
     CHECK(strcmp(flightdeck_implementation(), "portable") == 0);
+#elif defined(__wasm_simd128__)
+    CHECK(strcmp(flightdeck_implementation(), "simd128") == 0);
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     /*
      * When the compiler's runtime sees AVX2 or AVX-512, the library has to use it too.

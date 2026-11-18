@@ -8,9 +8,10 @@
  * Optional settings:
  * - FDECK_PARITY_BY_ROW, when there aren't enough vector registers for one per lane.
  * - FDECK_NINTH_STATE, to run a ninth state on plain 64-bit words next to eight in vectors.
+ * - FDECK_ROUNDS_PER_PASS, 1 or 2 (the default): how many rounds each loop iteration runs.
  * - FDECK_VECTOR_KEEP(), see flightdeck.c.
  *
- * Loading and storing blocks is written for 4 and 8 states on x86.
+ * Loading and storing blocks is written for 4 and 8 states on x86, and for 2 states on WebAssembly.
  *
  * A vector holds the same lane of every state.
  * A block overwrites the start of a state, so only the lanes after it, the capacity, carry over from one block to the next.
@@ -42,6 +43,9 @@
 #endif
 #ifndef FDECK_NINTH_STATE
 #    define FDECK_NINTH_STATE 0
+#endif
+#ifndef FDECK_ROUNDS_PER_PASS
+#    define FDECK_ROUNDS_PER_PASS 2
 #endif
 
 #define FDECK_INLINE FDECK_ALWAYS_INLINE FDECK_TARGET
@@ -147,7 +151,7 @@ FDECK_FN(round)(FDECK_V a[25], FDECK_V c[5], uint64_t round_constant)
 }
 
 /*
- * The last 12 or 24 rounds of Keccak-f[1600], two per loop iteration.
+ * The last 12 or 24 rounds of Keccak-f[1600], FDECK_ROUNDS_PER_PASS per loop iteration.
  *
  * Writing all of them out isn't faster, and the code gets too big for the CPU's cache of decoded instructions.
  * The last two rounds are outside the loop, so that the compiler can skip the lanes of the last one that nobody reads.
@@ -162,9 +166,11 @@ FDECK_FN(permute)(FDECK_V a[25], unsigned rounds)
     c[2] = FDECK_PARITY(a, 2);
     c[3] = FDECK_PARITY(a, 3);
     c[4] = FDECK_PARITY(a, 4);
-    for (unsigned first = 24 - rounds; first < 22; first += 2) {
+    for (unsigned first = 24 - rounds; first < 22; first += FDECK_ROUNDS_PER_PASS) {
         FDECK_FN(round)(a, c, fdeck_round_constants[first]);
-        FDECK_FN(round)(a, c, fdeck_round_constants[first + 1]);
+        if (FDECK_ROUNDS_PER_PASS == 2) {
+            FDECK_FN(round)(a, c, fdeck_round_constants[first + 1]);
+        }
     }
     FDECK_FN(round)(a, c, fdeck_round_constants[22]);
     FDECK_FN(round)(a, c, fdeck_round_constants[23]);
@@ -415,6 +421,66 @@ FDECK_FN(store_block)(uint8_t *out, const uint8_t *in, FDECK_V a[25], unsigned r
 
 #    define FDECK_COUNTERS(index) \
         _mm256_add_epi64(_mm256_set1_epi64x((long long) (index)), _mm256_setr_epi64x(0, 1, 2, 3))
+
+#elif FDECK_N == 2
+
+FDECK_INLINE void
+FDECK_FN(load_block)(FDECK_V a[25], const uint8_t *const in[2], unsigned rate_lanes)
+{
+#    define FDECK_LANES(lane)                                    \
+        do {                                                     \
+            const FDECK_V s0 = wasm_v128_load(in[0] + 8 * lane); \
+            const FDECK_V s1 = wasm_v128_load(in[1] + 8 * lane); \
+            a[lane]          = wasm_i64x2_shuffle(s0, s1, 0, 2); \
+            a[lane + 1]      = wasm_i64x2_shuffle(s0, s1, 1, 3); \
+        } while (0)
+    FDECK_LANES(0);
+    FDECK_LANES(2);
+    FDECK_LANES(4);
+    FDECK_LANES(6);
+    FDECK_LANES(8);
+    FDECK_LANES(10);
+    FDECK_LANES(12);
+    FDECK_LANES(14);
+    if (rate_lanes == 20) {
+        FDECK_LANES(16);
+        FDECK_LANES(18);
+    }
+#    undef FDECK_LANES
+}
+
+FDECK_INLINE void
+FDECK_FN(store_block)(uint8_t *out, const uint8_t *in, FDECK_V a[25], unsigned rate_lanes)
+{
+    const size_t rate = 8 * (size_t) rate_lanes;
+
+#    define FDECK_LANES(lane)                                                 \
+        do {                                                                  \
+            FDECK_V s0 = wasm_i64x2_shuffle(a[lane], a[lane + 1], 0, 2);      \
+            FDECK_V s1 = wasm_i64x2_shuffle(a[lane], a[lane + 1], 1, 3);      \
+            if (in != NULL) {                                                 \
+                s0 = wasm_v128_xor(s0, wasm_v128_load(in + 8 * lane));        \
+                s1 = wasm_v128_xor(s1, wasm_v128_load(in + rate + 8 * lane)); \
+            }                                                                 \
+            wasm_v128_store(out + 8 * lane, s0);                              \
+            wasm_v128_store(out + rate + 8 * lane, s1);                       \
+        } while (0)
+    FDECK_LANES(0);
+    FDECK_LANES(2);
+    FDECK_LANES(4);
+    FDECK_LANES(6);
+    FDECK_LANES(8);
+    FDECK_LANES(10);
+    FDECK_LANES(12);
+    FDECK_LANES(14);
+    if (rate_lanes == 20) {
+        FDECK_LANES(16);
+        FDECK_LANES(18);
+    }
+#    undef FDECK_LANES
+}
+
+#    define FDECK_COUNTERS(index) wasm_i64x2_make((int64_t) (index), (int64_t) (index) + 1)
 
 #else
 
@@ -776,3 +842,4 @@ FDECK_INSTANCES(FDECK_FUNCTIONS)
 #undef FDECK_LOAD_BYTES
 #undef FDECK_PARITY_BY_ROW
 #undef FDECK_NINTH_STATE
+#undef FDECK_ROUNDS_PER_PASS
