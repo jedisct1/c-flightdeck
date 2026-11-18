@@ -2,6 +2,7 @@
  * Tests for the overwrite duplex, FlightDeck and Deck-BO.
  *
  * `make test` builds this file three times: with the best backend for the CPU, without AVX-512, and with the plain C code only.
+ * `make test-wasm` builds it once more, for WebAssembly.
  */
 
 #define _DEFAULT_SOURCE

@@ -30,6 +30,17 @@ test: build/test build/test_avx2 build/test_portable
 	./build/test_avx2
 	./build/test_portable
 
+# Runs the tests on WebAssembly, under wasmer.
+# tests/wasm has the few C library functions they need.
+WASM_CC ?= zig cc -target wasm32-freestanding -mcpu=lime1
+WASM_RUN ?= wasmer run
+
+build/test.wasm: tests/test.c tests/sweep.h $(wildcard tests/wasm/*) $(SOURCES) | build
+	$(WASM_CC) $(CFLAGS) $(WARNINGS) -Itests/wasm -Isrc tests/test.c tests/wasm/libc.c src/flightdeck.c -o $@
+
+test-wasm: build/test.wasm
+	$(WASM_RUN) build/test.wasm
+
 build/bench: bench/bench.c libflightdeck.a | build
 	$(CC) $(CFLAGS) $(WARNINGS) -Isrc bench/bench.c libflightdeck.a -o $@
 
@@ -39,4 +50,4 @@ bench: build/bench
 clean:
 	rm -rf build flightdeck.o libflightdeck.a
 
-.PHONY: all test bench clean
+.PHONY: all test test-wasm bench clean
