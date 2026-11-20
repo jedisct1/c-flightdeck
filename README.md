@@ -59,8 +59,7 @@ That puts `libflightdeck.a` in `zig-out/lib` and `flightdeck.h` in `zig-out/incl
 Add `-Dlinkage=dynamic` if you want a shared library, and `-Dtarget=...` to cross-compile.
 
 It builds for a baseline CPU unless you pass `-Dcpu=...`, so the library runs on any machine of that architecture.
-That doesn't make it slower: the AVX2 and AVX-512 code is there anyway, and gets picked when the program runs.
-The same goes for the code that uses the SHA-3 instructions of ARM CPUs, on the systems listed below.
+That doesn't make it slower: the AVX2, AVX-512 and ARM SHA-3 code is there anyway, and gets picked when the program runs.
 
 To use it in a Zig project, add it to your `build.zig.zon`:
 
@@ -80,6 +79,7 @@ exe.root_module.linkLibrary(flightdeck.artifact("flightdeck"));
 
 On x86-64 with GCC or Clang, the library comes with code for AVX-512 and AVX2, and uses the best one your CPU and operating system support.
 That's decided when your program runs, so the same binary works on any x86-64 CPU.
+
 `flightdeck_implementation()` tells you which one you got: `"avx512"`, `"avx2"`, `"neon-sha3"`, `"neon"`, `"simd128"` or `"portable"`.
 
 You don't need `-march=native`.
@@ -89,6 +89,7 @@ On 64-bit ARM (little-endian AArch64) with GCC or Clang, the library works on th
 
 When the CPU has the SHA-3 instructions, the library uses them too, and you get `"neon-sha3"` instead of `"neon"`.
 That happens whenever your compiler targets such a CPU, like Apple's Clang and Zig do on Macs.
+
 Otherwise, the library asks the CPU when your program runs, on Linux, Android, FreeBSD and Apple systems.
 That needs GCC 14 or Clang 16, and doesn't work in freestanding builds.
 `-DFLIGHTDECK_NO_SHA3` turns the SHA-3 code off.
@@ -224,6 +225,7 @@ The only rule is that both sides go through the same messages and the same absor
 
 Squeezing doesn't count, because it doesn't move the session forward: what comes next is the same whether you squeezed or not.
 If you squeeze again, you get the bytes that follow, not the same ones, until the next message or absorb.
+
 There has to be something in the session first, though: squeezing a brand new session stops the program.
 
 An absorb is really just an empty message whose tag gets thrown away.
@@ -291,6 +293,7 @@ flightdeck_xor(&deck, ciphertext, plaintext, plaintext_len);
 
 The last argument of `flightdeck_duplex()` is a trailer: a few bits you can add to a string, so that different kinds of input can never be confused.
 It's a number made of those bits, least significant first, followed by a final 1.
+
 So `FLIGHTDECK_TRAILER_EMPTY`, which is 1, means no bits at all, 2 is the single bit 0, 3 is the single bit 1, and so on, up to 31.
 
 Need a clone? Just copy the structure.
