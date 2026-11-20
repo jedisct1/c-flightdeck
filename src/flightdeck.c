@@ -7,8 +7,16 @@
 
 #include "flightdeck.h"
 
-#include <stdlib.h>
-#include <string.h>
+#if __STDC_HOSTED__
+#    include <stdlib.h>
+#    include <string.h>
+#else
+/* No C library, as on WebAssembly with Zig: the compiler has its own versions of these. */
+#    define abort()          __builtin_trap()
+#    define memcpy(d, s, n)  __builtin_memcpy(d, s, n)
+#    define memmove(d, s, n) __builtin_memmove(d, s, n)
+#    define memset(d, c, n)  __builtin_memset(d, c, n)
+#endif
 
 #if defined(__GNUC__) && !defined(__clang__)
 #    define FDECK_GCC 1
