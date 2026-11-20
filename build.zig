@@ -38,22 +38,29 @@ pub fn build(b: *std.Build) void {
     lib.installHeader(b.path("src/flightdeck.h"), "flightdeck.h");
     b.installArtifact(lib);
 
-    // Like `make test`: on x86-64, the code without AVX-512 and the plain C code get their own builds of the library.
-    const variants = [_]struct { name: []const u8, macro: ?[]const u8 }{
-        .{ .name = "test", .macro = null },
-        .{ .name = "test-avx2", .macro = "FLIGHTDECK_NO_AVX512" },
-        .{ .name = "test-portable", .macro = "FLIGHTDECK_PORTABLE" },
+    // Like `make test`: on x86-64 and AArch64, the second best backend and plain C also get their own builds of the library.
+    // That's AVX2 instead of AVX-512, or NEON without SHA-3.
+    const variants = [_]struct { name: []const u8, macros: []const []const u8 }{
+        .{ .name = "test", .macros = &.{} },
+        .{ .name = "test-fallback", .macros = &.{ "FLIGHTDECK_NO_AVX512", "FLIGHTDECK_NO_SHA3" } },
+        .{ .name = "test-portable", .macros = &.{"FLIGHTDECK_PORTABLE"} },
     };
-    const variant_count: usize = if (!libc and !wasm) 0 else if (target.result.cpu.arch == .x86_64 and !portable) 3 else 1;
+    const has_fallback = switch (target.result.cpu.arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
+    };
+    const variant_count: usize = if (!libc and !wasm) 0 else if (has_fallback and !portable) 3 else 1;
     const test_step = b.step("test", "Run the tests");
     for (variants[0..variant_count]) |variant| {
         const tests = b.addExecutable(.{ .name = variant.name, .root_module = b.createModule(module_options) });
         const module = tests.root_module;
         module.addIncludePath(b.path("src"));
         module.addCSourceFile(.{ .file = b.path("tests/test.c"), .flags = flags });
-        if (variant.macro) |macro| {
+        if (variant.macros.len != 0) {
             module.addCSourceFile(.{ .file = b.path("src/flightdeck.c"), .flags = flags });
-            module.addCMacro(macro, "1");
+            for (variant.macros) |macro| {
+                module.addCMacro(macro, "1");
+            }
         } else {
             module.linkLibrary(lib);
             if (portable) {

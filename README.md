@@ -1,13 +1,15 @@
-# FlightDeck for C
+# FlightDeck (standalone C implementation)
 
 This is a C library for FlightDeck and Deck-BO.
+
 You can use it to hash data, to authenticate it, and to encrypt it.
 
 FlightDeck is a recent design by Joan Daemen, Silvia Mella and Gilles Van Assche, from the team behind SHA-3.
 It's built on the same permutation as SHA-3, and it's made to process long messages in parallel, which modern CPUs are really good at.
 
 The library has no dependencies.
-It's fast on x86-64 CPUs with AVX-512 or AVX2 and on WebAssembly with SIMD, and it runs pretty much anywhere else as plain C.
+It's fast on x86-64 CPUs with AVX-512 or AVX2, on 64-bit ARM CPUs, and on WebAssembly with SIMD.
+It runs pretty much anywhere else as plain C.
 
 It's a port of the original [Zig implementation](https://github.com/jedisct1/zig-flightdeck), like the [Rust version](https://github.com/jedisct1/rust-flightdeck), and all three give the same results, byte for byte.
 
@@ -58,6 +60,7 @@ Add `-Dlinkage=dynamic` if you want a shared library, and `-Dtarget=...` to cros
 
 It builds for a baseline CPU unless you pass `-Dcpu=...`, so the library runs on any machine of that architecture.
 That doesn't make it slower: the AVX2 and AVX-512 code is there anyway, and gets picked when the program runs.
+The same goes for the code that uses the SHA-3 instructions of ARM CPUs, on the systems listed below.
 
 To use it in a Zig project, add it to your `build.zig.zon`:
 
@@ -77,10 +80,21 @@ exe.root_module.linkLibrary(flightdeck.artifact("flightdeck"));
 
 On x86-64 with GCC or Clang, the library comes with code for AVX-512 and AVX2, and uses the best one your CPU and operating system support.
 That's decided when your program runs, so the same binary works on any x86-64 CPU.
-`flightdeck_implementation()` tells you which one you got: `"avx512"`, `"avx2"`, `"simd128"` or `"portable"`.
+`flightdeck_implementation()` tells you which one you got: `"avx512"`, `"avx2"`, `"neon-sha3"`, `"neon"`, `"simd128"` or `"portable"`.
 
 You don't need `-march=native`.
 It doesn't help, and with GCC and Clang it actually made things a little slower in our tests.
+
+On 64-bit ARM (little-endian AArch64) with GCC or Clang, the library works on three chunks of a long input at once: two in NEON registers, and one in regular registers.
+
+When the CPU has the SHA-3 instructions, the library uses them too, and you get `"neon-sha3"` instead of `"neon"`.
+That happens whenever your compiler targets such a CPU, like Apple's Clang and Zig do on Macs.
+Otherwise, the library asks the CPU when your program runs, on Linux, Android, FreeBSD and Apple systems.
+That needs GCC 14 or Clang 16, and doesn't work in freestanding builds.
+`-DFLIGHTDECK_NO_SHA3` turns the SHA-3 code off.
+
+On small in-order cores like the Cortex-A53 and A55, NEON probably doesn't help, and `-DFLIGHTDECK_PORTABLE` may be faster on long inputs.
+We haven't measured that, though: all of our ARM numbers come from Apple's CPUs.
 
 WebAssembly can't check for SIMD at run time, so you choose when you build.
 Compile with `-msimd128` to get the SIMD code, which wasmtime, wasmer and current browsers all support.
@@ -318,6 +332,21 @@ With AVX-512, Clang builds are about 8% faster on 64-byte messages, and up to 16
 
 For comparison, on the same machine, XKCP, the reference implementation, hashes at about 175 MiB/s with 64-byte messages, 880 MiB/s with 8 KiB and 5100 MiB/s with 1 MiB.
 
+On one performance core of an Apple M5 Max, built with Apple's Clang 21:
+
+| MiB/s   | Backend      | 64 B | 1 KiB | 8 KiB | 64 KiB | 1 MiB |
+| ------- | ------------ | ---: | ----: | ----: | -----: | ----: |
+| Hashing | NEON + SHA-3 | 1056 |  2481 |  3925 |   5596 |  6005 |
+|         | NEON         |  795 |  2085 |  2357 |   3539 |  3660 |
+|         | Plain C      |  808 |  2124 |  2346 |   2440 |  2424 |
+| Deck-BO | NEON + SHA-3 |  438 |  1499 |  2223 |   2753 |  2858 |
+|         | NEON         |  363 |  1197 |  1398 |   1779 |  1817 |
+|         | Plain C      |  385 |   967 |  1047 |   1088 |  1096 |
+
+The NEON rows come from the same CPU, built with `-mcpu=generic -DFLIGHTDECK_NO_SHA3` so that the compiler can't sneak in SHA-3 instructions.
+
+ARM CPUs without those instructions are usually much smaller than this one, so expect different numbers there.
+
 To get the numbers for your own machine, run `make bench` or `zig build bench`.
 They cover all four instances.
 
@@ -329,7 +358,12 @@ make test-wasm
 zig build test
 ```
 
-`make test` runs the tests three times: with the best code for your CPU, without AVX-512, and with plain C only.
+`make test` runs the tests three times: with the best code for your CPU, with the second best, and with plain C only.
+The second best is AVX2 instead of AVX-512 on x86-64, and NEON without SHA-3 on 64-bit ARM.
+
+On a Mac with Apple silicon, the compiler may use SHA-3 instructions even in the NEON code.
+To test without them, and to test how the library detects them at run time, use `make clean && make test CFLAGS="-O3 -mcpu=generic"`.
+
 `make test-wasm` runs them on WebAssembly with SIMD.
 It needs `zig` and `wasmer`, and you can swap those for other tools with `WASM_CC` and `WASM_RUN`.
 

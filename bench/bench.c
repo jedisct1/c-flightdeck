@@ -1,12 +1,17 @@
 /* Speed of the four instances: keyed input and output, hashing, and Deck-BO encryption. */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200112L
+#define _DARWIN_C_SOURCE
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef __APPLE__
+#    include <pthread.h>
+#endif
 
 #include "flightdeck.h"
 
@@ -116,6 +121,10 @@ main(void)
     buffers b;
     char    label[64];
 
+#ifdef __APPLE__
+    /* Keeps macOS from moving the benchmark to an efficiency core. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     b.in  = malloc(sizes[SIZES - 1]);
     b.out = malloc(sizes[SIZES - 1]);
     if (b.in == NULL || b.out == NULL) {

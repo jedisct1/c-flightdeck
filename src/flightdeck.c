@@ -46,6 +46,69 @@
 #    define FDECK_SIMD128 0
 #endif
 
+/*
+ * On little-endian AArch64, NEON is always used, and so are the SHA-3 instructions when the CPU has them.
+ * If the compiler doesn't target such a CPU, the SHA-3 code is built anyway and picked at run time on Linux, Android, FreeBSD and Apple systems.
+ * FLIGHTDECK_NO_SHA3 turns it off.
+ */
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(__ARM_BIG_ENDIAN) && \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(FLIGHTDECK_PORTABLE)
+#    define FDECK_ARM 1
+#    include <arm_neon.h>
+#else
+#    define FDECK_ARM 0
+#endif
+
+/*
+ * The SHA-3 intrinsics need GCC 9 or Clang 13.
+ * Using them in a function with a target attribute needs GCC 14 or Clang 16.
+ * Older GCC versions can't inline the rest of our code into such a function.
+ *
+ * Apple numbers its Clang versions differently, so it gets safe guesses.
+ */
+#if defined(__clang__) && defined(__apple_build_version__)
+#    define FDECK_SHA3_INTRINSICS (__clang_major__ >= 14)
+#    define FDECK_SHA3_ATTRIBUTE  (__clang_major__ >= 16)
+#elif defined(__clang__)
+#    define FDECK_SHA3_INTRINSICS (__clang_major__ >= 13)
+#    define FDECK_SHA3_ATTRIBUTE  (__clang_major__ >= 16)
+#else
+#    define FDECK_SHA3_INTRINSICS (__GNUC__ >= 9)
+#    define FDECK_SHA3_ATTRIBUTE  (__GNUC__ >= 14)
+#endif
+
+#if FDECK_ARM && !defined(FLIGHTDECK_NO_SHA3) && defined(__ARM_FEATURE_SHA3) && \
+    FDECK_SHA3_INTRINSICS
+#    define FDECK_SHA3        1
+#    define FDECK_SHA3_DETECT 0
+#    define FDECK_SHA3_TARGET
+#elif FDECK_ARM && !defined(FLIGHTDECK_NO_SHA3) && FDECK_SHA3_ATTRIBUTE && __STDC_HOSTED__ && \
+    (defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__))
+#    define FDECK_SHA3        1
+#    define FDECK_SHA3_DETECT 1
+#    if defined(__clang__)
+#        define FDECK_SHA3_TARGET __attribute__((target("sha3")))
+#    else
+#        define FDECK_SHA3_TARGET __attribute__((target("+sha3")))
+#    endif
+#else
+#    define FDECK_SHA3        0
+#    define FDECK_SHA3_DETECT 0
+#endif
+
+#if FDECK_SHA3_DETECT
+#    include <stdatomic.h>
+#    if defined(__APPLE__)
+#        include <sys/sysctl.h>
+#    else
+#        include <sys/auxv.h>
+#    endif
+/* Same bit on Linux and FreeBSD. */
+#    ifndef HWCAP_SHA3
+#        define HWCAP_SHA3 (1UL << 17)
+#    endif
+#endif
+
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #    define FDECK_LITTLE_ENDIAN 1
 #else
@@ -288,7 +351,7 @@ typedef const struct flightdeck_instance fdeck_instance;
     [variant] = { rate_lanes,           cv_lanes, blocks_per_chunk, pad, fdeck_##name##_absorb_c, \
                   { { 0, NULL, NULL } } },
 
-enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512, FDECK_WASM_SIMD128 };
+enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512, FDECK_WASM_SIMD128, FDECK_NEON, FDECK_NEON_SHA3 };
 
 #if FDECK_X86
 
@@ -366,7 +429,7 @@ enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512, FDECK_WASM_SIMD128 };
 #    define FDECK_V                 __m512i
 #    define FDECK_FN(name)          fdeck_##name##_avx512_x8
 #    define FDECK_TARGET            FDECK_AVX512_TARGET
-#    define FDECK_NINTH_STATE       FDECK_GCC
+#    define FDECK_EXTRA_STATE       FDECK_GCC
 #    define FDECK_XOR(a, b)         _mm512_xor_si512(a, b)
 #    define FDECK_XOR3(a, b, c)     _mm512_ternarylogic_epi64(a, b, c, 0x96)
 #    define FDECK_CHI(a, b, c)      _mm512_ternarylogic_epi64(a, b, c, 0xd2)
@@ -393,7 +456,7 @@ enum { FDECK_PORTABLE, FDECK_AVX2, FDECK_AVX512, FDECK_WASM_SIMD128 };
         },
 
 #    if FDECK_GCC
-#        define FDECK_NINTH_BATCH(name) { 9, fdeck_##name##_absorb9_avx512_x8, NULL },
+#        define FDECK_NINTH_BATCH(name) { 9, fdeck_##name##_absorb_extra_avx512_x8, NULL },
 #    else
 #        define FDECK_NINTH_BATCH(name)
 #    endif
@@ -475,6 +538,138 @@ fdeck_detect_backend(void)
 
 #endif
 
+/* No need for plain NEON when the compiler already targets CPUs with the SHA-3 instructions. */
+#define FDECK_PLAIN_NEON (FDECK_ARM && (!FDECK_SHA3 || FDECK_SHA3_DETECT))
+
+/*
+ * Batches run two states in NEON registers, and a third one in regular registers that would sit idle otherwise.
+ *
+ * Without SHA-3, two states in NEON alone are barely faster than plain C, so there's no batch for just them.
+ * A single state also uses plain C.
+ */
+#if FDECK_PLAIN_NEON
+
+#    define FDECK_N        2
+#    define FDECK_V        uint64x2_t
+#    define FDECK_FN(name) fdeck_##name##_neon_x2
+#    define FDECK_TARGET
+#    define FDECK_EXTRA_STATE       1
+#    define FDECK_EXTRA_OUTPUT      1
+#    define FDECK_EXTRA_ONLY        1
+#    define FDECK_XOR(a, b)         veorq_u64(a, b)
+#    define FDECK_XOR3(a, b, c)     veorq_u64(veorq_u64(a, b), c)
+#    define FDECK_CHI(a, b, c)      veorq_u64(a, vbicq_u64(c, b))
+#    define FDECK_ROL(a, n)         vsriq_n_u64(vshlq_n_u64(a, n), a, 64 - (n))
+#    define FDECK_SET1(x)           vdupq_n_u64(x)
+#    define FDECK_LOAD_LANES(p)     vld1q_u64(p)
+#    define FDECK_STORE_LANES(p, v) vst1q_u64(p, v)
+#    include "flightdeck_backend.inc"
+
+#    define FDECK_NEON_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds,   \
+                                pad)                                                             \
+        [variant] = {                                                                            \
+            rate_lanes,                                                                          \
+            cv_lanes,                                                                            \
+            blocks_per_chunk,                                                                    \
+            pad,                                                                                 \
+            fdeck_##name##_absorb_c,                                                             \
+            { { 3, fdeck_##name##_absorb_extra_neon_x2, fdeck_##name##_output_extra_neon_x2 } }, \
+        },
+
+#endif
+
+#if FDECK_SHA3
+
+/*
+ * Same thing with the SHA-3 instructions, plus a batch of just two states in NEON.
+ * XAR rotates right, hence 64 - n, and the mask only keeps the compiler quiet when n is 0.
+ */
+#    define FDECK_N                   2
+#    define FDECK_V                   uint64x2_t
+#    define FDECK_FN(name)            fdeck_##name##_sha3_x2
+#    define FDECK_TARGET              FDECK_SHA3_TARGET
+#    define FDECK_EXTRA_STATE         1
+#    define FDECK_EXTRA_OUTPUT        1
+#    define FDECK_XOR(a, b)           veorq_u64(a, b)
+#    define FDECK_XOR5(a, b, c, d, e) veor3q_u64(veor3q_u64(a, b, c), d, e)
+#    define FDECK_XOR_ROL1(a, b)      vrax1q_u64(a, b)
+#    define FDECK_XOR_ROL(a, b, n)    vxarq_u64(a, b, (64 - (n)) & 63)
+#    define FDECK_CHI(a, b, c)        vbcaxq_u64(a, c, b)
+#    define FDECK_SET1(x)             vdupq_n_u64(x)
+#    define FDECK_LOAD_LANES(p)       vld1q_u64(p)
+#    define FDECK_STORE_LANES(p, v)   vst1q_u64(p, v)
+#    include "flightdeck_backend.inc"
+
+/*
+ * Apple's CPUs run the SHA-3 instructions on all their vector units, so a single state is faster in NEON there.
+ * Arm's own cores only have one or two such units, and plain C is much faster for a single state.
+ * One round per loop iteration is also faster here.
+ */
+#    if defined(__APPLE__)
+#        define FDECK_N                   1
+#        define FDECK_V                   uint64x2_t
+#        define FDECK_FN(name)            fdeck_##name##_sha3_x1
+#        define FDECK_TARGET              FDECK_SHA3_TARGET
+#        define FDECK_ROUNDS_PER_PASS     1
+#        define FDECK_XOR(a, b)           veorq_u64(a, b)
+#        define FDECK_XOR5(a, b, c, d, e) veor3q_u64(veor3q_u64(a, b, c), d, e)
+#        define FDECK_XOR_ROL1(a, b)      vrax1q_u64(a, b)
+#        define FDECK_XOR_ROL(a, b, n)    vxarq_u64(a, b, (64 - (n)) & 63)
+#        define FDECK_CHI(a, b, c)        vbcaxq_u64(a, c, b)
+#        define FDECK_SET1(x)             vdupq_n_u64(x)
+#        define FDECK_LOAD_LANES(p)       vcombine_u64(vld1_u64(p), vcreate_u64(0))
+#        define FDECK_STORE_LANES(p, v)   vst1_u64(p, vget_low_u64(v))
+#        define FDECK_LOAD_BYTES(p) vcombine_u64(vreinterpret_u64_u8(vld1_u8(p)), vcreate_u64(0))
+#        include "flightdeck_backend.inc"
+#        define FDECK_SHA3_SINGLE(name) fdeck_##name##_absorb_sha3_x1
+#    else
+#        define FDECK_SHA3_SINGLE(name) fdeck_##name##_absorb_c
+#    endif
+
+#    define FDECK_SHA3_INSTANCE(variant, name, rate_lanes, cv_lanes, blocks_per_chunk, rounds,   \
+                                pad)                                                             \
+        [variant] = {                                                                            \
+            rate_lanes,                                                                          \
+            cv_lanes,                                                                            \
+            blocks_per_chunk,                                                                    \
+            pad,                                                                                 \
+            FDECK_SHA3_SINGLE(name),                                                             \
+            { { 2, fdeck_##name##_absorb_sha3_x2, fdeck_##name##_output_sha3_x2 },               \
+              { 3, fdeck_##name##_absorb_extra_sha3_x2, fdeck_##name##_output_extra_sha3_x2 } }, \
+        },
+
+#endif
+
+#if FDECK_SHA3_DETECT
+
+static int
+fdeck_detect_backend(void)
+{
+#    if defined(__APPLE__)
+    int    value = 0;
+    size_t size  = sizeof value;
+
+    /* Older systems only have the second name. */
+    if (sysctlbyname("hw.optional.arm.FEAT_SHA3", &value, &size, NULL, 0) != 0) {
+        size = sizeof value;
+        if (sysctlbyname("hw.optional.armv8_2_sha3", &value, &size, NULL, 0) != 0) {
+            value = 0;
+        }
+    }
+    const int has_sha3 = value != 0;
+#    elif defined(__linux__)
+    const int has_sha3 = (getauxval(AT_HWCAP) & HWCAP_SHA3) != 0;
+#    else
+    unsigned long hwcap = 0;
+    const int     has_sha3 =
+        elf_aux_info(AT_HWCAP, &hwcap, (int) sizeof hwcap) == 0 && (hwcap & HWCAP_SHA3) != 0;
+#    endif
+
+    return has_sha3 ? FDECK_NEON_SHA3 : FDECK_NEON;
+}
+
+#endif
+
 static const struct fdeck_backend {
     const char                *name;
     struct flightdeck_instance instances[4];
@@ -487,13 +682,19 @@ static const struct fdeck_backend {
 #if FDECK_SIMD128
     [FDECK_WASM_SIMD128] = { "simd128", { FDECK_INSTANCES(FDECK_SIMD128_INSTANCE) } },
 #endif
+#if FDECK_PLAIN_NEON
+    [FDECK_NEON] = { "neon", { FDECK_INSTANCES(FDECK_NEON_INSTANCE) } },
+#endif
+#if FDECK_SHA3
+    [FDECK_NEON_SHA3] = { "neon-sha3", { FDECK_INSTANCES(FDECK_SHA3_INSTANCE) } },
+#endif
 };
 
 /* The backend to use. The CPU is only checked once. */
 static int
 fdeck_backend_id(void)
 {
-#if FDECK_X86
+#if FDECK_X86 || FDECK_SHA3_DETECT
     /* If threads race here, they all store the same value. */
     static atomic_int cached  = -1;
     int               backend = atomic_load_explicit(&cached, memory_order_relaxed);
@@ -505,6 +706,10 @@ fdeck_backend_id(void)
     return backend;
 #elif FDECK_SIMD128
     return FDECK_WASM_SIMD128;
+#elif FDECK_SHA3
+    return FDECK_NEON_SHA3;
+#elif FDECK_ARM
+    return FDECK_NEON;
 #else
     return FDECK_PORTABLE;
 #endif
@@ -554,7 +759,7 @@ fdeck_capacity_len(fdeck_instance *im)
  *
  * That's the smallest batch that fits `count`, or the largest one if none does, since bigger batches cost more.
  * So a shorter last chunk only gets a slot that would be unused otherwise.
- * The exception is a batch with exactly one more slot for it, which is the nearly free ninth state.
+ * The exception is a batch with exactly one more slot for it, which is the nearly free extra state.
  */
 static const fdeck_batch *
 fdeck_batch_for(fdeck_instance *im, size_t count, int tail, int for_output)

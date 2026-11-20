@@ -15,19 +15,20 @@ flightdeck.o: $(SOURCES)
 build:
 	mkdir -p build
 
-# The tests run three times: with the best backend for this CPU, without AVX-512, and with plain C only.
+# The tests run three times: with the best backend for this CPU, with the second best, and with plain C only.
+# The second best is AVX2 instead of AVX-512 on x86-64, and NEON without SHA-3 on AArch64.
 build/test: tests/test.c tests/sweep.h libflightdeck.a | build
 	$(CC) $(CFLAGS) $(WARNINGS) -Isrc tests/test.c libflightdeck.a -o $@
 
-build/test_avx2: tests/test.c tests/sweep.h $(SOURCES) | build
-	$(CC) $(CFLAGS) $(WARNINGS) -DFLIGHTDECK_NO_AVX512 -Isrc tests/test.c src/flightdeck.c -o $@
+build/test_fallback: tests/test.c tests/sweep.h $(SOURCES) | build
+	$(CC) $(CFLAGS) $(WARNINGS) -DFLIGHTDECK_NO_AVX512 -DFLIGHTDECK_NO_SHA3 -Isrc tests/test.c src/flightdeck.c -o $@
 
 build/test_portable: tests/test.c tests/sweep.h $(SOURCES) | build
 	$(CC) $(CFLAGS) $(WARNINGS) -DFLIGHTDECK_PORTABLE -Isrc tests/test.c src/flightdeck.c -o $@
 
-test: build/test build/test_avx2 build/test_portable
+test: build/test build/test_fallback build/test_portable
 	./build/test
-	./build/test_avx2
+	./build/test_fallback
 	./build/test_portable
 
 # Runs the tests on WebAssembly with SIMD, under wasmer.

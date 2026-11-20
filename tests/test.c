@@ -27,6 +27,52 @@
 
 #include "flightdeck.h"
 
+/*
+ * Whether the library should use the SHA-3 instructions on AArch64.
+ * Only checked with GCC 14 or Clang 16 and later, which always build that code.
+ */
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(__ARM_BIG_ENDIAN) && \
+    !defined(FLIGHTDECK_PORTABLE) &&                                             \
+    ((defined(__clang__) && __clang_major__ >= 16) ||                            \
+     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 14))
+#    if defined(FLIGHTDECK_NO_SHA3)
+#        define EXPECT_SHA3() 0
+#    elif defined(__ARM_FEATURE_SHA3)
+#        define EXPECT_SHA3() 1
+#    elif __STDC_HOSTED__ && (defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__))
+#        if defined(__APPLE__)
+#            include <sys/sysctl.h>
+#        else
+#            include <sys/auxv.h>
+#        endif
+
+static int
+cpu_has_sha3(void)
+{
+#        if defined(__APPLE__)
+    int    value = 0;
+    size_t size  = sizeof value;
+
+    if (sysctlbyname("hw.optional.arm.FEAT_SHA3", &value, &size, NULL, 0) != 0) {
+        size = sizeof value;
+        if (sysctlbyname("hw.optional.armv8_2_sha3", &value, &size, NULL, 0) != 0) {
+            return 0;
+        }
+    }
+    return value != 0;
+#        elif defined(__linux__)
+    return (getauxval(AT_HWCAP) & (1UL << 17)) != 0;
+#        else
+    unsigned long hwcap = 0;
+
+    return elf_aux_info(AT_HWCAP, &hwcap, (int) sizeof hwcap) == 0 && (hwcap & (1UL << 17)) != 0;
+#        endif
+}
+
+#        define EXPECT_SHA3() cpu_has_sha3()
+#    endif
+#endif
+
 #define SWEEP_OD_INIT(v, d, key, n) \
     flightdeck_od_init((flightdeck_od *) (d), (flightdeck_variant) (v), key, n)
 #define SWEEP_OD_CLONE_COMPACT(v, clone, d) \
@@ -316,6 +362,7 @@ test_hash(void)
 /*
  * Output that ends right before a guard page, since reading or writing too far wouldn't change any result.
  * First deck output XORed in place, with lengths around the batch sizes of the backends, then duplex output.
+ * The deck output is checked against a keystream squeezed one block at a time, which doesn't use the batches.
  */
 static void
 test_output_ends(void)
@@ -323,24 +370,34 @@ test_output_ends(void)
     static const size_t blocks[6] = { 1, 4, 5, 8, 9, 20 };
     uint8_t            *end       = guarded(20 * 160 + 1);
     uint8_t             expected[20 * 160 + 1];
+    uint8_t             keystream[20 * 160 + 1];
 
     for (int v = 0; v < 4; v++) {
+        const size_t  rate = sweep_rate(v);
         flightdeck    start;
+        flightdeck    reference;
         flightdeck_od d;
 
         flightdeck_init(&start, variants[v], (const uint8_t *) "key", 3);
         flightdeck_duplex(&start, NULL, 0, NULL, 0, FLIGHTDECK_TRAILER_EMPTY);
+        reference = start;
+        for (size_t i = 0; i < sizeof keystream; i += rate) {
+            flightdeck_squeeze(&reference, keystream + i,
+                               sizeof keystream - i < rate ? sizeof keystream - i : rate);
+        }
         for (size_t k = 0; k < 6; k++) {
             for (size_t extra = 0; extra < 3; extra++) {
-                const size_t len  = blocks[k] * sweep_rate(v) + extra - 1;
+                const size_t len  = blocks[k] * rate + extra - 1;
+                uint8_t     *out  = end - len;
                 flightdeck   deck = start;
 
                 sweep_pattern(expected, len, 7, k);
-                memcpy(end - len, expected, len);
-                flightdeck_xor(&deck, end - len, end - len, len);
-                deck = start;
-                flightdeck_xor(&deck, end - len, end - len, len);
-                CHECK(memcmp(end - len, expected, len) == 0);
+                memcpy(out, expected, len);
+                flightdeck_xor(&deck, out, out, len);
+                for (size_t i = 0; i < len; i++) {
+                    out[i] ^= keystream[i];
+                }
+                CHECK(memcmp(out, expected, len) == 0);
             }
         }
         flightdeck_od_init(&d, variants[v], NULL, 0);
@@ -431,6 +488,8 @@ test_parameters(void)
 #    endif
         CHECK(strcmp(flightdeck_implementation(), expected) == 0);
     }
+#elif defined(EXPECT_SHA3)
+    CHECK(strcmp(flightdeck_implementation(), EXPECT_SHA3() ? "neon-sha3" : "neon") == 0);
 #endif
 }
 
