@@ -1,6 +1,5 @@
 /*
- * The few C library functions that the tests need on WebAssembly, so that they run without a WASI sysroot.
- * Zig's compiler runtime already has the memory functions and strlen().
+ * What wasm-minilibc leaves to the application: printing, memory allocation, and the entry point.
  * Printing and exiting use two WASI calls, which both wasmer and wasmtime support.
  */
 
@@ -21,16 +20,6 @@ wasi_fd_write(int32_t fd, const wasi_iovec *iovs, size_t iovs_len, size_t *writt
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exit"))) _Noreturn void
 wasi_proc_exit(int32_t code);
-
-int
-strcmp(const char *a, const char *b)
-{
-    while (*a != 0 && *a == *b) {
-        a++;
-        b++;
-    }
-    return (unsigned char) *a - (unsigned char) *b;
-}
 
 static void
 write_out(const char *s, size_t len)
@@ -99,12 +88,6 @@ void
 free(void *p)
 {
     (void) p;
-}
-
-_Noreturn void
-abort(void)
-{
-    __builtin_trap();
 }
 
 int main(void);

@@ -31,12 +31,13 @@ test: build/test build/test_avx2 build/test_portable
 	./build/test_portable
 
 # Runs the tests on WebAssembly with SIMD, under wasmer.
-# tests/wasm has the few C library functions they need.
+# The C library comes from wasm-minilibc, and tests/wasm/wasi.c adds what it leaves to the application.
 WASM_CC ?= zig cc -target wasm32-freestanding -mcpu=lime1+simd128
 WASM_RUN ?= wasmer run
 
-build/test.wasm: tests/test.c tests/sweep.h $(wildcard tests/wasm/*) $(SOURCES) | build
-	$(WASM_CC) $(CFLAGS) $(WARNINGS) -Itests/wasm -Isrc tests/test.c tests/wasm/libc.c src/flightdeck.c -o $@
+build/test.wasm: tests/test.c tests/sweep.h $(wildcard tests/wasm/*.[ch] tests/wasm/minilibc/*/*) $(SOURCES) | build
+	$(WASM_CC) $(CFLAGS) $(WARNINGS) -Itests/wasm -Itests/wasm/minilibc/include -Isrc \
+		tests/test.c tests/wasm/wasi.c tests/wasm/minilibc/src/libc.c src/flightdeck.c -o $@
 
 test-wasm: build/test.wasm
 	$(WASM_RUN) build/test.wasm

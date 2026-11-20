@@ -61,9 +61,10 @@ pub fn build(b: *std.Build) void {
             }
         }
         if (wasm) {
-            // tests/wasm has the few C library functions the tests need.
+            // The C library comes from wasm-minilibc, and tests/wasm/wasi.c adds what it leaves to the application.
             module.addIncludePath(b.path("tests/wasm"));
-            module.addCSourceFile(.{ .file = b.path("tests/wasm/libc.c"), .flags = flags });
+            module.addIncludePath(b.path("tests/wasm/minilibc/include"));
+            module.addCSourceFiles(.{ .files = &.{ "tests/wasm/wasi.c", "tests/wasm/minilibc/src/libc.c" }, .flags = flags });
         }
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
